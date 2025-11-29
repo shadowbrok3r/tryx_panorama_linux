@@ -415,7 +415,8 @@ impl eframe::App for AioCoolerApp {
 // ============================================================================
 
 fn main() -> eframe::Result {
-    env_logger::init();
+    
+    egui_logger::builder().max_level(log::LevelFilter::Info).init().unwrap();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
