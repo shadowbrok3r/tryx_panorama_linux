@@ -26,11 +26,13 @@ jobs:
       - name: Install clang and mold
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang
+          # system libs needed by libudev-sys
+          sudo apt-get install -y clang pkg-config libudev-dev
           curl -L "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-x86_64-linux.tar.gz" -o mold.tar.gz
           tar -xzf mold.tar.gz
           sudo cp mold-${MOLD_VERSION}-x86_64-linux/bin/mold /usr/bin/mold
-
+          mold --version
+          
       - name: Build (release)
         run: cargo build --release
 
