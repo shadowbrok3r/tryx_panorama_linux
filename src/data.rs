@@ -3,10 +3,109 @@
 // Reverse-engineered from com.baiyi.service.serialservice.serialdataservice
 // ============================================================================
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
+use std::{fmt::{self, Write as _}, time::{SystemTime, UNIX_EPOCH}};
 const FRAME_MARKER: u8 = 0x5A;
 const ESCAPE_MARKER: u8 = 0x5B;
+const CRLF: &str = "\r\n";
+
+#[derive(Debug)]
+pub enum ContentType {
+    Json,
+    // Binary,
+    // Text,
+}
+
+impl ContentType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ContentType::Json => "json",
+        }
+    }
+}
+
+/// Attempt #2 to fix build_message to make it more ergonomic
+#[derive(Debug)]
+pub struct CommandMessage<'a> {
+    pub cmd_type: &'a str,
+    pub seq_number: i64,
+    pub ack_number: i64,
+    pub content_type: ContentType,
+    pub body: &'a str,
+    pub date: i64,
+    pub file_name: i64,
+    pub file_size: i64,
+    pub content_range: i64,
+    pub counter: i64,
+    pub msg_id: i64,
+}
+
+impl<'a> CommandMessage<'a> {
+    pub fn new(cmd_type: &'a str, body: &'a str) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        let seq = (now % 100_000) as i64;
+        let ts = now as i64;
+
+        CommandMessage {
+            cmd_type,
+            seq_number: seq,
+            ack_number: -1,
+            content_type: ContentType::Json,
+            body,
+            date: ts,
+            file_name: -1,
+            file_size: -1,
+            content_range: -1,
+            counter: -1,
+            msg_id: -1,
+        }
+    }
+
+    fn write_header(
+        out: &mut String,
+        name: &str,
+        value: impl fmt::Display,
+    ) -> fmt::Result {
+        write!(out, "{name}={value}{CRLF}")
+    }
+
+    /// Build message content in HTTP-like format:
+    /// POST cmdType version\r\n
+    /// Key=Value\r\n
+    /// ...\r\n
+    /// \r\n
+    /// {json}
+    pub fn to_bytes(&self) -> anyhow::Result<Vec<u8>, anyhow::Error> {
+        // This feels disgusting // TODO: Please for the love of god, I need to find a better solution
+        let mut msg = String::with_capacity(
+            "POST  1\r\n\r\n".len() + self.cmd_type.len() + self.body.len() + 128,
+        );
+
+        // Request line
+        write!(&mut msg, "POST {} 1{CRLF}", self.cmd_type)?;
+
+        // Headers
+        Self::write_header(&mut msg, "SeqNumber", self.seq_number)?;
+        Self::write_header(&mut msg, "AckNumber", self.ack_number)?;
+        Self::write_header(&mut msg, "ContentLength", self.body.len())?;
+        Self::write_header(&mut msg, "ContentType", self.content_type.as_str())?;
+        Self::write_header(&mut msg, "FileName", self.file_name)?;
+        Self::write_header(&mut msg, "FileSize", self.file_size)?;
+        Self::write_header(&mut msg, "ContentRange", self.content_range)?;
+        Self::write_header(&mut msg, "Counter", self.counter)?;
+        Self::write_header(&mut msg, "Date", self.date)?;
+        Self::write_header(&mut msg, "msgId", self.msg_id)?;
+
+        // Blank line + body
+        msg.push_str(CRLF);
+        msg.push_str(self.body);
+
+        Ok(msg.into_bytes())
+    }
+}
 
 /// Escape special bytes in the data
 /// 0x5A -> 0x5B 0x01
