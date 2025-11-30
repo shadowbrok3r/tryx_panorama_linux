@@ -1,0 +1,54 @@
+name: RustCI
+
+on:
+  push:
+    branches: [ "master" ]
+    tags:
+      - "v*"
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  MOLD_VERSION: "2.40.4"
+  
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang and mold
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+          curl -L "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-x86_64-linux.tar.gz" -o mold.tar.gz
+          tar -xzf mold.tar.gz
+          sudo cp mold-${MOLD_VERSION}-x86_64-linux/bin/mold /usr/bin/mold
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Extract version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+
+      - name: Rename release binary
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cp target/x86_64-unknown-linux-gnu/release/tryx_panorama_linux \
+             tryx_panorama_linux-${VERSION}
+
+      - name: Create GitHub Release and upload binary
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            tryx_panorama_linux-${{ env.VERSION }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
