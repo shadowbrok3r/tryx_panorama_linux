@@ -9,6 +9,7 @@ use egui_logger::logger_ui;
 mod screen_setup;
 mod data;
 mod app_state;
+mod sysinfo;
 
 impl eframe::App for app_state::AioCoolerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

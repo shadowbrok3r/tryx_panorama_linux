@@ -26,6 +26,7 @@ impl ContentType {
         }
     }
 }
+
 /// Attempt #3 to fix build_message to make it more ergonomic
 #[derive(Debug)]
 pub struct CommandMessageBuilder<'a> {
@@ -175,6 +176,72 @@ impl<'a> CommandMessage<'a> {
     }
 }
 
+/// Command message attempt #4 as a temporary test
+#[derive(Debug)]
+pub struct CommandMessageWithMethod<'a> {
+    pub method: &'a str,
+    pub cmd_type: &'a str,
+    pub seq_number: i64,
+    pub ack_number: i64,
+    pub content_type: ContentType,
+    pub body: &'a str,
+    pub date: i64,
+    pub file_name: i64,
+    pub file_size: i64,
+    pub content_range: i64,
+    pub counter: i64,
+    pub msg_id: i64,
+}
+
+impl<'a> CommandMessageWithMethod<'a> {
+    pub fn new(method: &'a str, cmd_type: &'a str, body: &'a str) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        Self {
+            method,
+            cmd_type,
+            seq_number: (now % 100_000) as i64,
+            ack_number: -1,
+            content_type: ContentType::Json,
+            body,
+            date: now as i64,
+            file_name: -1,
+            file_size: -1,
+            content_range: -1,
+            counter: -1,
+            msg_id: -1,
+        }
+    }
+
+    pub fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        let mut msg = String::with_capacity(256 + self.body.len());
+
+        // Request line: METHOD cmdType version
+        write!(&mut msg, "{} {} 1{CRLF}", self.method, self.cmd_type)?;
+
+        // Headers
+        write!(&mut msg, "SeqNumber={}{CRLF}", self.seq_number)?;
+        write!(&mut msg, "AckNumber={}{CRLF}", self.ack_number)?;
+        write!(&mut msg, "ContentLength={}{CRLF}", self.body.len())?;
+        write!(&mut msg, "ContentType={}{CRLF}", self.content_type.as_str())?;
+        write!(&mut msg, "FileName={}{CRLF}", self.file_name)?;
+        write!(&mut msg, "FileSize={}{CRLF}", self.file_size)?;
+        write!(&mut msg, "ContentRange={}{CRLF}", self.content_range)?;
+        write!(&mut msg, "Counter={}{CRLF}", self.counter)?;
+        write!(&mut msg, "Date={}{CRLF}", self.date)?;
+        write!(&mut msg, "msgId={}{CRLF}", self.msg_id)?;
+
+        // Blank line + body
+        msg.push_str(CRLF);
+        msg.push_str(self.body);
+
+        Ok(msg.into_bytes())
+    }
+}
+
 /// Escape special bytes in the data
 /// 0x5A -> 0x5B 0x01
 /// 0x5B -> 0x5B 0x02
@@ -217,17 +284,37 @@ fn build_frame(message: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// Send a framed command over serial
+
+/// Send a framed POST command over serial
 pub fn send_command(
     port: &mut Box<dyn serialport::SerialPort>,
     cmd_type: &str,
     json_value: &serde_json::Value,
 ) -> anyhow::Result<()> {
+    send_request(port, "POST", cmd_type, json_value)
+}
+
+/// Send a framed STATE command over serial (used for sysinfo updates)
+pub fn send_state_command(
+    port: &mut Box<dyn serialport::SerialPort>,
+    cmd_type: &str,
+    json_value: &serde_json::Value,
+) -> anyhow::Result<()> {
+    send_request(port, "STATE", cmd_type, json_value)
+}
+
+/// Internal: send a framed request with given method (POST/STATE)
+fn send_request(
+    port: &mut Box<dyn serialport::SerialPort>,
+    method: &str,
+    cmd_type: &str,
+    json_value: &serde_json::Value,
+) -> anyhow::Result<()> {
     let body = serde_json::to_string(json_value)?;
-    let msg = CommandMessage::new(cmd_type, &body);
+    let msg = CommandMessageWithMethod::new(method, cmd_type, &body);
     let frame = build_frame(&msg.to_bytes()?);
 
-    log::info!("Sending {} ({} bytes, frame: {} bytes)", cmd_type, body.len(), frame.len());
+    log::info!("Sending {} {} ({} bytes)", method, cmd_type, body.len());
     log::debug!(
         "Frame hex: {}...{}",
         hex_string(&frame[..30.min(frame.len())]),

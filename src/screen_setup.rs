@@ -1,11 +1,10 @@
-use std::{path::PathBuf, process::Command, sync::mpsc::{self, Receiver, Sender}, thread, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{path::PathBuf, process::Command, thread, time::Duration};
 use serde::{Deserialize, Serialize};
-use eframe::egui::{self, Color32};
 use anyhow::{Context, Result};
-use std::io::{Read, Write};
-use egui_logger::logger_ui;
+use std::io::Read;
 
-use crate::data::send_command;
+use crate::data::{send_command, send_state_command};
+use crate::sysinfo::SysInfo;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenConfig {
@@ -49,6 +48,7 @@ impl AioCoolerController {
 
     pub fn adb_push(&self, local_path: &PathBuf, remote_name: &str) -> Result<()> {
         log::info!("Pushing image to device through ADB");
+        
         let status = Command::new("adb")
             .args(["wait-for-device"])
             .status()
@@ -71,15 +71,45 @@ impl AioCoolerController {
             anyhow::bail!("ADB push failed: {}", stderr);
         }
 
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        log::info!("ADB push output: {}", stdout.trim());
+
+        // Verify file exists and has correct size
+        let expected_size = std::fs::metadata(local_path)?.len();
+        let size_check = Command::new("adb")
+            .args(["shell", "stat", "-c", "%s", &remote_path])
+            .output()?;
+        
+        if size_check.status.success() {
+            let remote_size: u64 = String::from_utf8_lossy(&size_check.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            
+            if remote_size != expected_size {
+                anyhow::bail!(
+                    "File size mismatch: local={}, remote={}",
+                    expected_size,
+                    remote_size
+                );
+            }
+            log::info!("Verified file size: {} bytes", remote_size);
+        }
+
+        // Small delay to ensure device has processed the file
+        thread::sleep(Duration::from_millis(500));
+
         log::info!("ADB push successful");
         Ok(())
     }
 
+    /// Send screen configuration command with sysinfo to keep connection alive.
+    /// Skip transport/transported commands for nowbecause those expect file data over serial.
     pub fn send_image_commands(
         &self,
         file_name: &str,
-        file_size: u64,
-        file_md5: &str,
+        _file_size: u64,
+        _file_md5: &str,
         config: &ScreenConfig,
     ) -> Result<()> {
         log::info!("Opening serial port: {}", self.serial_device);
@@ -90,35 +120,31 @@ impl AioCoolerController {
             .context("Failed to open serial port")?;
 
         // Clear buffers
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(100));
         let _ = port.clear(serialport::ClearBuffer::All);
 
-        // Send transport command
+        // Send initial sysinfo to establish connection
+        log::info!("Sending initial sysinfo...");
+        self.send_sysinfo(&mut port)?;
+        thread::sleep(Duration::from_millis(200));
+
+        // Clean up old media files FIRST to avoid playlist fuckery
+        log::info!("Cleaning up old media files (keeping: {})", file_name);
         send_command(
             &mut port,
-            "transport",
+            "mediaDelete",
             &serde_json::json!({
-                "type": "media",
-                "fileSize": file_size,
-                "fileName": file_name
+                "exclude": [file_name]
             }),
         )?;
-
         thread::sleep(Duration::from_millis(300));
 
-        // Send transported command
-        send_command(
-            &mut port,
-            "transported",
-            &serde_json::json!({
-                "md5": file_md5,
-                "fileName": file_name
-            }),
-        )?;
+        // Keepalive
+        self.send_sysinfo(&mut port)?;
+        thread::sleep(Duration::from_millis(200));
 
-        thread::sleep(Duration::from_millis(300));
-
-        // Send screen config
+        // Send screen config with new file
+        log::info!("Sending screen configuration for: {}", file_name);
         send_command(
             &mut port,
             "waterBlockScreenId",
@@ -141,9 +167,24 @@ impl AioCoolerController {
             }),
         )?;
 
-        thread::sleep(Duration::from_millis(500));
-        log::info!("All commands sent successfully!");
+        // Send several sysinfo updates to keep connection alive and display temps
+        log::info!("Sending sysinfo updates to keep connection alive...");
+        for i in 0..5 {
+            thread::sleep(Duration::from_millis(800));
+            self.send_sysinfo(&mut port)?;
+            log::debug!("Sysinfo update {}/5", i + 1);
+        }
 
+        log::info!("Screen configuration sent successfully!");
+        Ok(())
+    }
+
+    /// Send current system info (CPU/GPU temps, etc)
+    fn send_sysinfo(&self, port: &mut Box<dyn serialport::SerialPort>) -> Result<()> {
+        let info = SysInfo::get_sysinfo();
+        let json = serde_json::to_value(&info)?;
+        send_state_command(port, "all", &json)?;
+        log::debug!("Sysinfo: CPU {}°C, GPU {}°C", info.cpu.temperature, info.gpu.temperature);
         Ok(())
     }
 

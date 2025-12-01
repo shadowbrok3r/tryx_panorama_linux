@@ -102,13 +102,17 @@ Decompiled from: `com.baiyi.service.serialservice`
 | Command | Direction | Purpose | Implemented |
 |---------|-----------|---------|-------------|
 | `conn` | Device→PC | Connection handshake, device capabilities | ❌ |
-| `transport` | PC→Device | Announce file transfer (name, size, type) | ✅ |
-| `transported` | PC→Device | Confirm transfer complete (md5, fileName) | ✅ |
+| `transport` | PC→Device | Start serial file transfer (creates empty file) | ❌ (see note) |
+| `transported` | PC→Device | End serial file transfer (md5 verify) | ❌ (see note) |
 | `waterBlockScreenId` | PC→Device | Configure display (mode, media, overlays) | ✅ |
 | `mediaDelete` | PC→Device | Delete media files | ❌ |
 | `turboPump` | PC→Device | Control turbo pump | ❌ |
 | `config` | PC→Device | Device configuration | ❌ |
 | `all` | Both | System state broadcast | ❌ |
+
+> **Note**: `transport`/`transported` are for streaming files over serial. The device creates
+> an empty file on `transport` and writes incoming serial bytes until `transported`. Since we
+> use ADB push instead, we skip these commands to avoid overwriting the pushed file.
 
 ## Project Structure
 
@@ -134,7 +138,7 @@ src/
 
 - `AioCoolerController` — Main controller struct
 - `adb_push()` — Push files via ADB to `/sdcard/pcMedia/`
-- `send_image_commands()` — Send transport→transported→waterBlockScreenId sequence
+- `send_image_commands()` — Send waterBlockScreenId to configure display
 - `calculate_md5()` — File hash for transfer verification
 
 **`app_state.rs`** — UI state management
@@ -144,10 +148,15 @@ src/
 
 ## Image Transfer Flow
 
-1. **ADB Push** — Copy image to device at `/sdcard/pcMedia/<timestamp>.png`
-2. **transport** — Announce transfer: `{ "type": "media", "fileSize": N, "fileName": "..." }`
-3. **transported** — Confirm complete: `{ "md5": "...", "fileName": "..." }`
-4. **waterBlockScreenId** — Configure display:
+### Windows Software (Serial Streaming)
+1. `transport` → device creates empty file, opens FileOutputStream
+2. **Raw file bytes over serial** → device writes to file
+3. `transported` → confirms MD5, closes file
+4. `waterBlockScreenId` → configure display
+
+### This Tool (ADB Push)
+1. **ADB Push** — Copy image to `/sdcard/pcMedia/<timestamp>.png`
+2. **waterBlockScreenId** — Configure display:
    ```json
    {
      "id": "Customization",
@@ -164,6 +173,9 @@ src/
      "sysinfoDisplay": ["CPU Temperature", "GPU Temperature"]
    }
    ```
+
+> We skip `transport`/`transported` because they're designed for serial file streaming.
+> Sending them after ADB push would create an empty file and overwrite our data!
 
 ## Not Implemented
 

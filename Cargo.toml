@@ -17,8 +17,16 @@ serialport = "4.8.1"
 md5 = "0.8.0"
 rfd = "0.16.0"
 chrono = "0.4"
+sysinfo = { version = "0.37.2", features = ["serde", "multithread"] }
 
 [dependencies.egui]
 version = "0.33"
 default-features = false
 features = ["rayon", "bytemuck"]
+
+
+[profile.release]
+strip = true
+lto = true
+debug = false
+opt-level = 3
