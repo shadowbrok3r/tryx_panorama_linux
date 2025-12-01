@@ -3,7 +3,11 @@
 // Reverse-engineered from com.baiyi.service.serialservice.serialdataservice
 // ============================================================================
 
-use std::{fmt::{self, Write as _}, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    fmt::{self, Write as _},
+    io::Write,
+    time::{SystemTime, UNIX_EPOCH},
+};
 const FRAME_MARKER: u8 = 0x5A;
 const ESCAPE_MARKER: u8 = 0x5B;
 const CRLF: &str = "\r\n";
@@ -22,8 +26,21 @@ impl ContentType {
         }
     }
 }
+/// Attempt #3 to fix build_message to make it more ergonomic
+#[derive(Debug)]
+pub struct CommandMessageBuilder<'a> {
+    cmd_type: &'a str,
+    body: &'a str,
+    seq_number: Option<i64>,
+    ack_number: i64,
+    content_type: ContentType,
+    file_name: i64,
+    file_size: i64,
+    content_range: i64,
+    counter: i64,
+    msg_id: i64,
+}
 
-/// Attempt #2 to fix build_message to make it more ergonomic
 #[derive(Debug)]
 pub struct CommandMessage<'a> {
     pub cmd_type: &'a str,
@@ -37,6 +54,57 @@ pub struct CommandMessage<'a> {
     pub content_range: i64,
     pub counter: i64,
     pub msg_id: i64,
+}
+
+impl<'a> CommandMessageBuilder<'a> {
+    pub fn new(cmd_type: &'a str, body: &'a str) -> Self {
+        CommandMessageBuilder {
+            cmd_type,
+            body,
+            seq_number: None,
+            ack_number: -1,
+            content_type: ContentType::Json,
+            file_name: -1,
+            file_size: -1,
+            content_range: -1,
+            counter: -1,
+            msg_id: -1,
+        }
+    }
+
+    pub fn seq_number(mut self, seq: i64) -> Self {
+        self.seq_number = Some(seq);
+        self
+    }
+
+    pub fn ack_number(mut self, ack: i64) -> Self {
+        self.ack_number = ack;
+        self
+    }
+
+    pub fn build(self) -> CommandMessage<'a> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        let seq = self.seq_number.unwrap_or((now % 100_000) as i64);
+        let ts = now as i64;
+
+        CommandMessage {
+            cmd_type: self.cmd_type,
+            seq_number: seq,
+            ack_number: self.ack_number,
+            content_type: self.content_type,
+            body: self.body,
+            date: ts,
+            file_name: self.file_name,
+            file_size: self.file_size,
+            content_range: self.content_range,
+            counter: self.counter,
+            msg_id: self.msg_id,
+        }
+    }
 }
 
 impl<'a> CommandMessage<'a> {
@@ -149,56 +217,17 @@ fn build_frame(message: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// Build message content in HTTP-like format:
-/// POST cmdType version\r\n
-/// Key=Value\r\n
-/// ...\r\n
-/// \r\n
-/// {json}
-fn build_message(cmd_type: &str, json_content: &str) -> Vec<u8> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-
-    let seq = (now % 100000) as i64;
-    let ts = now as i64;
-
-    let headers = format!(
-        "SeqNumber={}\r\n\
-         AckNumber=-1\r\n\
-         ContentLength={}\r\n\
-         ContentType=json\r\n\
-         FileName=-1\r\n\
-         FileSize=-1\r\n\
-         ContentRange=-1\r\n\
-         Counter=-1\r\n\
-         Date={}\r\n\
-         msgId=-1",
-        seq,
-        json_content.len(),
-        ts
-    );
-
-    let message = format!("POST {} 1\r\n{}\r\n\r\n{}", cmd_type, headers, json_content);
-    message.into_bytes()
-}
-
+/// Send a framed command over serial
 pub fn send_command(
     port: &mut Box<dyn serialport::SerialPort>,
     cmd_type: &str,
     json_value: &serde_json::Value,
-) -> anyhow::Result<(), anyhow::Error> {
-    let json_content = serde_json::to_string(json_value)?;
-    let message = build_message(cmd_type, &json_content);
-    let frame = build_frame(&message);
+) -> anyhow::Result<()> {
+    let body = serde_json::to_string(json_value)?;
+    let msg = CommandMessage::new(cmd_type, &body);
+    let frame = build_frame(&msg.to_bytes()?);
 
-    log::info!(
-        "Sending {} ({} bytes, frame: {} bytes)",
-        cmd_type,
-        json_content.len(),
-        frame.len()
-    );
+    log::info!("Sending {} ({} bytes, frame: {} bytes)", cmd_type, body.len(), frame.len());
     log::debug!(
         "Frame hex: {}...{}",
         hex_string(&frame[..30.min(frame.len())]),
@@ -207,7 +236,6 @@ pub fn send_command(
 
     port.write_all(&frame)?;
     port.flush()?;
-
     Ok(())
 }
 
