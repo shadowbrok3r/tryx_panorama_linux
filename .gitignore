@@ -1,1 +1,4 @@
 /target
+# Reverse-engineering assets (large; local only)
+/aio-reverse/
+/ImportantInfo*.txt

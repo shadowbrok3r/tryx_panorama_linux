@@ -3,27 +3,44 @@ name = "tryx_panorama_linux"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Default build is CLI-only so it works (and builds fast) on headless machines.
+# Build the desktop app with: cargo build --features gui
+default = []
+gui = [
+    "dep:eframe",
+    "dep:egui",
+    "dep:egui_logger",
+    "dep:egui_extras",
+    "dep:rfd",
+    "dep:crossbeam",
+]
+
 [dependencies]
-eframe = { version = "0.33", features = ["persistence", "serde", "default_fonts", "glow", "x11"], default-features = false }
-egui_logger = { git = "https://github.com/shadowbrok3r/egui_logger" }
-egui_extras = { version = "0.33", features = ["default", "image"] }
+eframe = { version = "0.35", features = ["persistence", "serde", "default_fonts", "glow", "x11"], default-features = false, optional = true }
+egui_logger = { version="0.11", optional = true }
+egui_extras = { version = "0.35", features = ["default", "image"], optional = true }
 serde = { version = "1", features = ["derive"] }
-crossbeam = "0.8"
+crossbeam = { version = "0.8", optional = true }
 serde_json = "1"
 anyhow = "1"
 log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
 
-serialport = "4.8.1"
+# default-features = false: skip libudev (needs pkg-config + libudev-dev at build
+# time); port enumeration falls back to sysfs, which is all we need.
+serialport = { version = "4.9", default-features = false }
 md5 = "0.8.0"
-rfd = "0.16.0"
+rfd = { version = "0.17", optional = true }
 chrono = "0.4"
-sysinfo = { version = "0.37.2", features = ["serde", "multithread"] }
+ctrlc = { version = "3", features = ["termination"] }
 
 [dependencies.egui]
-version = "0.33"
+version = "0.35"
 default-features = false
 features = ["rayon", "bytemuck"]
-
+optional = true
 
 [profile.release]
 strip = true

@@ -1,0 +1,37 @@
+[Unit]
+Description=Tryx Panorama AIO display — sysinfo daemon
+Documentation=https://github.com/shadowbrok3r/tryx_panorama_linux
+# Wait for the device's serial node. /dev/tryx0 is created by the udev rule in
+# the README; systemd derives this .device unit from that symlink's real device.
+After=dev-tryx0.device
+Wants=dev-tryx0.device
+
+[Service]
+Type=simple
+# Stream system stats to the display at 1 Hz. --conn logs device identity on
+# each (re)connect; the daemon reconnects internally if the link drops, and
+# Restart=always covers the process dying outright.
+ExecStart=/usr/local/bin/tryx_panorama_linux --port /dev/tryx0 daemon --conn --quiet
+Restart=always
+RestartSec=2
+Environment=RUST_LOG=info
+
+# Running as root unlocks CPU package power via RAPL (energy_uj is root-only)
+# and needs no group setup. For least privilege instead, comment out nothing
+# here (root is the default) and swap to a dedicated user — CPU power then
+# reports 0:
+#   User=tryx
+#   SupplementaryGroups=dialout
+# ADB (used only by the `image` command, not the daemon) must be reachable by
+# whichever user runs those commands; the daemon itself needs only the tty.
+
+# Light hardening (safe for a device daemon)
+Nice=5
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+# RAPL + serial need these readable/writable:
+ReadWritePaths=/dev
+
+[Install]
+WantedBy=multi-user.target

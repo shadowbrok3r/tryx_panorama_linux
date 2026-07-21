@@ -94,14 +94,14 @@ impl AioCoolerApp {
                 let _ = tx.send(AppMessage::Progress(0.1, "Calculating MD5...".to_string()));
                 let _ = tx.send(AppMessage::Log("Calculating file MD5...".to_string()));
 
-                let file_md5 = crate::AioCoolerController::calculate_md5(&image_path)?;
+                let file_md5 = crate::screen_setup::AioCoolerController::calculate_md5(&image_path)?;
                 let file_size = std::fs::metadata(&image_path)?.len();
 
                 let extension = image_path
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("png");
-                let remote_name = crate::AioCoolerController::generate_filename(extension);
+                let remote_name = crate::screen_setup::AioCoolerController::generate_filename(extension);
 
                 let _ = tx.send(AppMessage::Log(format!(
                     "File: {} ({} bytes, MD5: {})",
@@ -113,7 +113,7 @@ impl AioCoolerApp {
                 let _ = tx.send(AppMessage::Progress(0.2, "Pushing to device via ADB...".to_string()));
                 let _ = tx.send(AppMessage::Log("Starting ADB push...".to_string()));
 
-                let controller = crate::AioCoolerController::new(&serial_device);
+                let controller = crate::screen_setup::AioCoolerController::new(&serial_device);
                 controller.adb_push(&image_path, &remote_name)?;
 
                 let _ = tx.send(AppMessage::Progress(0.5, "Sending serial commands...".to_string()));

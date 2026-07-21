@@ -1,297 +1,299 @@
-use std::{path::PathBuf, process::Command, sync::mpsc::{self, Receiver, Sender}, thread, time::{Duration, SystemTime, UNIX_EPOCH}};
-use crate::screen_setup::{AioCoolerController, ScreenConfig};
-use serde::{Deserialize, Serialize};
-use eframe::egui::{self, Color32};
-use anyhow::{Context, Result};
-use std::io::{Read, Write};
-use egui_logger::logger_ui;
+use std::path::PathBuf;
 
-mod screen_setup;
-mod data;
+use clap::{Args, Parser, Subcommand};
+
+#[cfg(feature = "gui")]
 mod app_state;
+mod commands;
+mod data;
+#[cfg(feature = "gui")]
+mod gui;
+mod screen_setup;
 mod sysinfo;
 
-impl eframe::App for app_state::AioCoolerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.process_messages();
+use screen_setup::ScreenConfig;
 
-        if self.is_processing {
-            ctx.request_repaint();
-        }
+#[derive(Parser)]
+#[command(
+    name = "tryx_panorama_linux",
+    version,
+    about = "Tryx Panorama AIO display controller for Linux",
+    long_about = "Controls the Tryx Panorama AIO cooler display over USB serial (CDC-ACM) and ADB.\n\
+                  Run `detect` first to find the device and diagnose permissions."
+)]
+struct Cli {
+    /// Serial device (run `detect` to find it)
+    #[arg(short, long, global = true, default_value = "/dev/ttyACM0")]
+    port: String,
 
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.heading("Tryx Panorama Display Controller");
-            });
-            ui.add_space(4.0);
-        });
+    /// Increase log verbosity (-v debug, -vv trace)
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
 
-        // Bottom panel - Status and progress
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(&self.status_message);
-                if self.is_processing {
-                    ui.spinner();
-                }
-            });
-            if self.is_processing || self.progress > 0.0 {
-                ui.add(egui::ProgressBar::new(self.progress).show_percentage());
-            }
-            ui.add_space(4.0);
-        });
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
 
-        // Left panel - Log
-        egui::SidePanel::left("log_panel")
-            .resizable(true)
-            .default_width(300.0)
-            .show(ctx, |ui| {
-                ui.heading("📋 Logs");
-                ui.separator();
+#[derive(Subcommand)]
+enum Cmd {
+    /// Find the device, check serial permissions and ADB availability
+    Detect,
+    /// Handshake: query device identity and capabilities (POST conn)
+    Conn {
+        /// Retry attempts (device ignores input for ~5s after boot)
+        #[arg(long, default_value_t = 5)]
+        retries: u32,
+    },
+    /// Decode and print incoming frames from the device
+    Listen {
+        /// Also dump raw RX bytes as hex
+        #[arg(long)]
+        hex: bool,
+        /// Stop after this many seconds (default: run until Ctrl-C)
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+        /// Send sysinfo every 5s so the device doesn't reset its port
+        #[arg(long)]
+        keepalive: bool,
+    },
+    /// Send a raw protocol command, then print replies
+    Send {
+        /// Command type (conn, all, config, waterBlockScreenId, turboPump, …)
+        cmd_type: String,
+        /// JSON body
+        #[arg(long, default_value = "{}")]
+        json: String,
+        /// Request method token (POST or STATE)
+        #[arg(long, default_value = "POST")]
+        method: String,
+        /// How long to listen for replies afterwards
+        #[arg(long, default_value_t = 3)]
+        wait_secs: u64,
+    },
+    /// Stream system info (STATE all) to the display
+    Sysinfo {
+        /// Milliseconds between updates
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        /// Number of updates to send (0 = until Ctrl-C)
+        #[arg(long, default_value_t = 0)]
+        count: u64,
+        /// Print the JSON payload instead of sending it
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Run continuously: stream sysinfo at 1Hz with auto-reconnect (for systemd)
+    Daemon {
+        /// Milliseconds between updates
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        /// Send a conn handshake and log device identity on each (re)connect
+        #[arg(long)]
+        conn: bool,
+        /// Suppress the periodic status line (logs still emit)
+        #[arg(long)]
+        quiet: bool,
+        /// Print a status line every N ticks (0 = never)
+        #[arg(long, default_value_t = 10)]
+        status_every: u64,
+    },
+    /// Push an image via ADB and configure the display to show it
+    Image {
+        /// Image file (png/jpg/gif/…)
+        path: PathBuf,
+        /// Skip the mediaDelete step (keep existing files on the device)
+        #[arg(long)]
+        keep_media: bool,
+        #[command(flatten)]
+        config: ScreenConfigArgs,
+    },
+    /// Configure the display for media already on the device (no upload)
+    Screen {
+        /// Media file name(s) on the device (in /sdcard/pcMedia)
+        #[arg(required = true)]
+        media: Vec<String>,
+        #[command(flatten)]
+        config: ScreenConfigArgs,
+    },
+    /// Control the turbo pump (POST turboPump)
+    Pump {
+        /// Enable turbo mode
+        #[arg(long)]
+        enable: bool,
+        /// PWM value (device init default: 65)
+        #[arg(long, default_value_t = 65)]
+        value: u32,
+        /// How long to listen for the ACK afterwards
+        #[arg(long, default_value_t = 2)]
+        wait_secs: u64,
+    },
+    /// Set display brightness (0-100%)
+    Brightness {
+        value: u8,
+    },
+    /// Turn the display panel on or off
+    ScreenPower {
+        #[arg(value_enum)]
+        state: Switch,
+    },
+    /// Keep the panel on (or not) while the PC sleeps
+    DisplayInSleep {
+        #[arg(value_enum)]
+        state: Switch,
+    },
+    /// Launch the desktop GUI (requires building with --features gui)
+    Gui,
+}
 
-                egui_logger::logger_ui()
-                .warn_color(Color32::from_rgb(94, 215, 221)) 
-                .error_color(Color32::from_rgb(255, 55, 102)) 
-                .log_levels([true, true, true, false, false])
-                .show(ui);
-            });
+#[derive(clap::ValueEnum, Clone, Copy)]
+enum Switch {
+    On,
+    Off,
+}
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.group(|ui| {
-                    ui.heading("⚙️ Device Settings");
-                    ui.separator();
-
-                    ui.horizontal(|ui| {
-                        ui.label("Serial Device:");
-                        ui.text_edit_singleline(&mut self.serial_device);
-                    });
-                });
-
-                ui.add_space(10.0);
-
-                ui.group(|ui| {
-                    ui.heading("Image Selection");
-                    ui.separator();
-
-                    ui.horizontal(|ui| {
-                        if ui.button("Browse...").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp"])
-                                .pick_file()
-                            {
-                                self.selected_image = Some(path);
-                            }
-                        }
-
-                        if let Some(path) = &self.selected_image {
-                            ui.label(format!("Selected: {}", path.display()));
-                        } else {
-                            ui.label("No image selected");
-                        }
-                    });
-                });
-
-                ui.add_space(10.0);
-
-                ui.group(|ui| {
-                    ui.heading("Screen Configuration");
-                    ui.separator();
-
-                    egui::Grid::new("screen_config_grid")
-                        .num_columns(2)
-                        .spacing([20.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("Screen Mode:");
-                            egui::ComboBox::from_id_salt("screen_mode")
-                                .selected_text(&self.screen_config.screen_mode)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.screen_config.screen_mode,
-                                        "Full Screen".to_string(),
-                                        "Full Screen",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.screen_config.screen_mode,
-                                        "Window".to_string(),
-                                        "Window",
-                                    );
-                                });
-                            ui.end_row();
-
-                            ui.label("Play Mode:");
-                            egui::ComboBox::from_id_salt("play_mode")
-                                .selected_text(&self.screen_config.play_mode)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.screen_config.play_mode,
-                                        "Single".to_string(),
-                                        "Single",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.screen_config.play_mode,
-                                        "Loop".to_string(),
-                                        "Loop",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.screen_config.play_mode,
-                                        "Slideshow".to_string(),
-                                        "Slideshow",
-                                    );
-                                });
-                            ui.end_row();
-
-                            ui.label("Ratio:");
-                            egui::ComboBox::from_id_salt("ratio")
-                                .selected_text(&self.screen_config.ratio)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.screen_config.ratio,
-                                        "2:1".to_string(),
-                                        "2:1",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.screen_config.ratio,
-                                        "16:9".to_string(),
-                                        "16:9",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.screen_config.ratio,
-                                        "4:3".to_string(),
-                                        "4:3",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.screen_config.ratio,
-                                        "1:1".to_string(),
-                                        "1:1",
-                                    );
-                                });
-                            ui.end_row();
-
-                            ui.label("Alignment:");
-                            egui::ComboBox::from_id_salt("align")
-                                .selected_text(&self.screen_config.align)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.screen_config.align,
-                                        "Left".to_string(),
-                                        "Left",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.screen_config.align,
-                                        "Center".to_string(),
-                                        "Center",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.screen_config.align,
-                                        "Right".to_string(),
-                                        "Right",
-                                    );
-                                });
-                            ui.end_row();
-
-                            ui.label("Color:");
-                            ui.text_edit_singleline(&mut self.screen_config.color);
-                            ui.end_row();
-
-                            ui.label("Filter Opacity:");
-                            ui.add(egui::Slider::new(&mut self.screen_config.filter_opacity, 0..=100).suffix("%"));
-                            ui.end_row();
-                        });
-                });
-
-                ui.add_space(10.0);
-
-                ui.group(|ui| {
-                    ui.heading("🏷️ Overlays");
-                    ui.separator();
-
-                    ui.horizontal(|ui| {
-                        ui.label("Badges:");
-                    });
-
-                    let badges = ["CPU Badge", "GPU Badge", "RAM Badge", "FPS Badge"];
-                    ui.horizontal_wrapped(|ui| {
-                        for badge in badges {
-                            let mut enabled = self.screen_config.badges.contains(&badge.to_string());
-                            if ui.checkbox(&mut enabled, badge).changed() {
-                                if enabled {
-                                    self.screen_config.badges.push(badge.to_string());
-                                } else {
-                                    self.screen_config.badges.retain(|b| b != badge);
-                                }
-                            }
-                        }
-                    });
-
-                    ui.add_space(8.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label("System Info:");
-                    });
-
-                    let sysinfo_options = [
-                        "CPU Temperature",
-                        "GPU Temperature",
-                        "CPU Usage",
-                        "GPU Usage",
-                        "RAM Usage",
-                        "Fan Speed",
-                    ];
-                    ui.horizontal_wrapped(|ui| {
-                        for info in sysinfo_options {
-                            let mut enabled = self.screen_config.sysinfo_display.contains(&info.to_string());
-                            if ui.checkbox(&mut enabled, info).changed() {
-                                if enabled {
-                                    self.screen_config.sysinfo_display.push(info.to_string());
-                                } else {
-                                    self.screen_config.sysinfo_display.retain(|i| i != info);
-                                }
-                            }
-                        }
-                    });
-                });
-
-                ui.add_space(20.0);
-
-                // Transfer Button
-                ui.horizontal(|ui| {
-                    let button = egui::Button::new("🚀 Transfer Image to Cooler")
-                        .min_size(egui::vec2(200.0, 40.0));
-
-                    let enabled = !self.is_processing && self.selected_image.is_some();
-
-                    if ui.add_enabled(enabled, button).clicked() {
-                        self.start_transfer();
-                    }
-                });
-            });
-        });
+impl From<Switch> for bool {
+    fn from(s: Switch) -> bool {
+        matches!(s, Switch::On)
     }
 }
 
-// ============================================================================
-// Main Entry Point
-// ============================================================================
+#[derive(Args)]
+struct ScreenConfigArgs {
+    /// "Full Screen" (or "Screen Splitting" — not supported yet)
+    #[arg(long, default_value = "Full Screen")]
+    screen_mode: String,
+    /// Single or Loop
+    #[arg(long, default_value = "Single")]
+    play_mode: String,
+    #[arg(long, default_value = "2:1")]
+    ratio: String,
+    #[arg(long, default_value = "#dcdcdc")]
+    color: String,
+    /// Left, Center or Right
+    #[arg(long, default_value = "Left")]
+    align: String,
+    /// Animation overlay: Rain, Smoke (device built-ins)
+    #[arg(long)]
+    filter: Option<String>,
+    #[arg(long, default_value_t = 100)]
+    filter_opacity: u8,
+    /// Comma-separated: "CPU Badge,GPU Badge,RAM Badge,FPS Badge"
+    #[arg(long, value_delimiter = ',', default_value = "GPU Badge,CPU Badge")]
+    badges: Vec<String>,
+    /// Comma-separated: "CPU Temperature,GPU Temperature,CPU Usage,…"
+    #[arg(long, value_delimiter = ',', default_value = "CPU Temperature,GPU Temperature")]
+    sysinfo_display: Vec<String>,
+}
 
-fn main() -> eframe::Result {
-    
-    egui_logger::builder().max_level(log::LevelFilter::Info).init().unwrap();
+impl From<&ScreenConfigArgs> for ScreenConfig {
+    fn from(a: &ScreenConfigArgs) -> Self {
+        Self {
+            id: "Customization".to_string(),
+            screen_mode: a.screen_mode.clone(),
+            play_mode: a.play_mode.clone(),
+            ratio: a.ratio.clone(),
+            color: a.color.clone(),
+            align: a.align.clone(),
+            filter_value: a.filter.clone(),
+            filter_opacity: a.filter_opacity,
+            badges: a.badges.clone(),
+            sysinfo_display: a.sysinfo_display.clone(),
+        }
+    }
+}
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 700.0])
-            .with_min_inner_size([600.0, 400.0]),
-        ..Default::default()
+fn init_cli_logging(verbose: u8) {
+    let level = match verbose {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
+        .format_timestamp_millis()
+        .init();
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    let command = match cli.command {
+        Some(cmd) => cmd,
+        // No subcommand: launch the GUI when it's compiled in, otherwise show help
+        None => {
+            #[cfg(feature = "gui")]
+            {
+                Cmd::Gui
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                use clap::CommandFactory;
+                Cli::command().print_help()?;
+                return Ok(());
+            }
+        }
     };
 
-    eframe::run_native(
-        "Tryx Panorama Display Controller",
-        options,
-        Box::new(|cc| {
-            egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(app_state::AioCoolerApp::default()))
-        }),
-    )
+    match command {
+        Cmd::Gui => {
+            #[cfg(feature = "gui")]
+            {
+                // The GUI installs its own logger (egui_logger)
+                gui::run()
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                anyhow::bail!(
+                    "This binary was built without the GUI. Rebuild with: cargo build --features gui"
+                )
+            }
+        }
+        cmd => {
+            init_cli_logging(cli.verbose);
+            match cmd {
+                Cmd::Detect => commands::detect(),
+                Cmd::Conn { retries } => commands::conn(&cli.port, retries),
+                Cmd::Listen {
+                    hex,
+                    timeout_secs,
+                    keepalive,
+                } => commands::listen(&cli.port, hex, timeout_secs, keepalive),
+                Cmd::Send {
+                    cmd_type,
+                    json,
+                    method,
+                    wait_secs,
+                } => commands::send(&cli.port, &method, &cmd_type, &json, wait_secs),
+                Cmd::Sysinfo {
+                    interval_ms,
+                    count,
+                    dry_run,
+                } => commands::sysinfo_stream(&cli.port, interval_ms, count, dry_run),
+                Cmd::Daemon {
+                    interval_ms,
+                    conn,
+                    quiet,
+                    status_every,
+                } => commands::daemon(&cli.port, interval_ms, conn, quiet, status_every),
+                Cmd::Image {
+                    path,
+                    keep_media,
+                    config,
+                } => commands::image(&cli.port, &path, &ScreenConfig::from(&config), keep_media),
+                Cmd::Screen { media, config } => {
+                    commands::screen(&cli.port, &media, &ScreenConfig::from(&config))
+                }
+                Cmd::Pump {
+                    enable,
+                    value,
+                    wait_secs,
+                } => commands::pump(&cli.port, enable, value, wait_secs),
+                Cmd::Brightness { value } => commands::brightness(&cli.port, value, 2),
+                Cmd::ScreenPower { state } => commands::screen_power(&cli.port, state.into(), 2),
+                Cmd::DisplayInSleep { state } => {
+                    commands::display_in_sleep(&cli.port, state.into(), 2)
+                }
+                Cmd::Gui => unreachable!(),
+            }
+        }
+    }
 }

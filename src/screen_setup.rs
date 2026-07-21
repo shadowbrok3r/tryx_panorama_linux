@@ -14,6 +14,9 @@ pub struct ScreenConfig {
     pub ratio: String,
     pub color: String,
     pub align: String,
+    /// Built-in animation overlay (device plays /system/media/anim/<name>.webp).
+    /// Observed values: "Rain", "Smoke". None = no filter.
+    pub filter_value: Option<String>,
     pub filter_opacity: u8,
     pub badges: Vec<String>,
     pub sysinfo_display: Vec<String>,
@@ -28,10 +31,36 @@ impl Default for ScreenConfig {
             ratio: "2:1".to_string(),
             color: "#dcdcdc".to_string(),
             align: "Left".to_string(),
+            filter_value: None,
             filter_opacity: 100,
             badges: vec!["GPU Badge".to_string(), "CPU Badge".to_string()],
             sysinfo_display: vec!["CPU Temperature".to_string(), "GPU Temperature".to_string()],
         }
+    }
+}
+
+impl ScreenConfig {
+    /// The waterBlockScreenId payload for a media playlist (Full Screen form;
+    /// "Screen Splitting" uses arrays for settings/sysinfoDisplay and no ratio
+    /// — not implemented yet).
+    pub fn to_water_block_json(&self, media: &[String]) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "screenMode": self.screen_mode,
+            "playMode": self.play_mode,
+            "ratio": self.ratio,
+            "media": media,
+            "settings": {
+                "color": self.color,
+                "align": self.align,
+                "filter": {
+                    "value": self.filter_value,
+                    "opacity": self.filter_opacity
+                },
+                "badges": self.badges
+            },
+            "sysinfoDisplay": self.sysinfo_display
+        })
     }
 }
 
@@ -103,18 +132,10 @@ impl AioCoolerController {
         Ok(())
     }
 
-    /// Send screen configuration command with sysinfo to keep connection alive.
-    /// Skip transport/transported commands for nowbecause those expect file data over serial.
-    pub fn send_image_commands(
-        &self,
-        file_name: &str,
-        _file_size: u64,
-        _file_md5: &str,
-        config: &ScreenConfig,
-    ) -> Result<()> {
+    fn open_port(&self) -> Result<Box<dyn serialport::SerialPort>> {
         log::info!("Opening serial port: {}", self.serial_device);
 
-        let mut port = serialport::new(&self.serial_device, 115200)
+        let port = serialport::new(&self.serial_device, 115200)
             .timeout(Duration::from_secs(2))
             .open()
             .context("Failed to open serial port")?;
@@ -122,6 +143,21 @@ impl AioCoolerController {
         // Clear buffers
         thread::sleep(Duration::from_millis(100));
         let _ = port.clear(serialport::ClearBuffer::All);
+        Ok(port)
+    }
+
+    /// Send screen configuration command with sysinfo to keep connection alive.
+    /// Skip transport/transported commands for now because those expect file data over serial.
+    /// (GUI transfer path; the CLI uses the full announce/commit flow in commands.rs)
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    pub fn send_image_commands(
+        &self,
+        file_name: &str,
+        _file_size: u64,
+        _file_md5: &str,
+        config: &ScreenConfig,
+    ) -> Result<()> {
+        let mut port = self.open_port()?;
 
         // Send initial sysinfo to establish connection
         log::info!("Sending initial sysinfo...");
@@ -129,11 +165,13 @@ impl AioCoolerController {
         thread::sleep(Duration::from_millis(200));
 
         // Clean up old media files FIRST to avoid playlist fuckery
+        // (the Windows app always sends type:"custom" with the exclude list)
         log::info!("Cleaning up old media files (keeping: {})", file_name);
         send_command(
             &mut port,
             "mediaDelete",
             &serde_json::json!({
+                "type": "custom",
                 "exclude": [file_name]
             }),
         )?;
@@ -143,39 +181,44 @@ impl AioCoolerController {
         self.send_sysinfo(&mut port)?;
         thread::sleep(Duration::from_millis(200));
 
-        // Send screen config with new file
-        log::info!("Sending screen configuration for: {}", file_name);
-        send_command(
-            &mut port,
-            "waterBlockScreenId",
-            &serde_json::json!({
-                "id": config.id,
-                "screenMode": config.screen_mode,
-                "playMode": config.play_mode,
-                "ratio": config.ratio,
-                "media": [file_name],
-                "settings": {
-                    "color": config.color,
-                    "align": config.align,
-                    "filter": {
-                        "value": null,
-                        "opacity": config.filter_opacity
-                    },
-                    "badges": config.badges
-                },
-                "sysinfoDisplay": config.sysinfo_display
-            }),
-        )?;
-
-        // Send several sysinfo updates to keep connection alive and display temps
-        log::info!("Sending sysinfo updates to keep connection alive...");
-        for i in 0..5 {
-            thread::sleep(Duration::from_millis(800));
-            self.send_sysinfo(&mut port)?;
-            log::debug!("Sysinfo update {}/5", i + 1);
-        }
+        self.send_screen_config_on(&mut port, &[file_name.to_string()], config)?;
+        self.keepalive(&mut port, 5)?;
 
         log::info!("Screen configuration sent successfully!");
+        Ok(())
+    }
+
+    /// Configure the display for already-present media (no upload, no cleanup).
+    pub fn send_screen_config(&self, media: &[String], config: &ScreenConfig) -> Result<()> {
+        let mut port = self.open_port()?;
+
+        log::info!("Sending initial sysinfo...");
+        self.send_sysinfo(&mut port)?;
+        thread::sleep(Duration::from_millis(200));
+
+        self.send_screen_config_on(&mut port, media, config)?;
+        self.keepalive(&mut port, 5)?;
+        Ok(())
+    }
+
+    fn send_screen_config_on(
+        &self,
+        port: &mut Box<dyn serialport::SerialPort>,
+        media: &[String],
+        config: &ScreenConfig,
+    ) -> Result<()> {
+        log::info!("Sending screen configuration for: {media:?}");
+        send_command(port, "waterBlockScreenId", &config.to_water_block_json(media))
+    }
+
+    /// Send several sysinfo updates to keep the connection alive and populate temps
+    fn keepalive(&self, port: &mut Box<dyn serialport::SerialPort>, updates: u32) -> Result<()> {
+        log::info!("Sending sysinfo updates to keep connection alive...");
+        for i in 0..updates {
+            thread::sleep(Duration::from_millis(800));
+            self.send_sysinfo(port)?;
+            log::debug!("Sysinfo update {}/{updates}", i + 1);
+        }
         Ok(())
     }
 
