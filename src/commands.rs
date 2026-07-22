@@ -3,7 +3,8 @@
 // ============================================================================
 
 use std::{
-    io::Read,
+    io::{self, Read, Write},
+    net::{TcpListener, TcpStream},
     path::PathBuf,
     process::Command,
     sync::{
@@ -23,7 +24,28 @@ use crate::sysinfo::{SysInfo, SysInfoReader};
 const TRYX_VID: u16 = 0x18d1;
 const TRYX_PID: u16 = 0x2d03;
 
+/// Open the device transport. A `tcp://host:port` path connects to a remote
+/// `bridge` (see [`bridge`]) instead of a local serial device, so the desktop
+/// GUI/CLI can drive a cooler attached to another machine on the LAN. Everything
+/// downstream keeps operating on a `Box<dyn serialport::SerialPort>`.
 pub fn open_port(path: &str) -> Result<Box<dyn serialport::SerialPort>> {
+    if let Some(addr) = path.strip_prefix("tcp://") {
+        let stream = TcpStream::connect(addr).with_context(|| {
+            format!(
+                "Failed to connect to serial bridge {addr}\n\
+                 Start the bridge on the machine wired to the cooler:\n\
+                 tryx_panorama_linux --port /dev/tryx0 bridge --listen 0.0.0.0:9600"
+            )
+        })?;
+        stream.set_nodelay(true).ok();
+        let timeout = Duration::from_millis(100);
+        stream.set_read_timeout(Some(timeout)).ok();
+        return Ok(Box::new(TcpSerial {
+            stream,
+            addr: addr.to_string(),
+            timeout,
+        }));
+    }
     let port = serialport::new(path, 115200)
         .timeout(Duration::from_millis(100))
         .open()
@@ -35,6 +57,226 @@ pub fn open_port(path: &str) -> Result<Box<dyn serialport::SerialPort>> {
             )
         })?;
     Ok(port)
+}
+
+/// A `TcpStream` masquerading as a `serialport::SerialPort` so the network
+/// transport is a drop-in for the local one. The one behavior that matters to
+/// callers: a read timeout on a socket surfaces as `WouldBlock`, but the framing
+/// loops expect a serial-style `TimedOut` — so we remap it in `read`.
+struct TcpSerial {
+    stream: TcpStream,
+    addr: String,
+    timeout: Duration,
+}
+
+impl io::Read for TcpSerial {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.stream.read(buf) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "tcp read timeout"))
+            }
+            other => other,
+        }
+    }
+}
+
+impl io::Write for TcpSerial {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl serialport::SerialPort for TcpSerial {
+    fn name(&self) -> Option<String> {
+        Some(format!("tcp://{}", self.addr))
+    }
+    fn baud_rate(&self) -> serialport::Result<u32> {
+        Ok(115200)
+    }
+    fn data_bits(&self) -> serialport::Result<serialport::DataBits> {
+        Ok(serialport::DataBits::Eight)
+    }
+    fn flow_control(&self) -> serialport::Result<serialport::FlowControl> {
+        Ok(serialport::FlowControl::None)
+    }
+    fn parity(&self) -> serialport::Result<serialport::Parity> {
+        Ok(serialport::Parity::None)
+    }
+    fn stop_bits(&self) -> serialport::Result<serialport::StopBits> {
+        Ok(serialport::StopBits::One)
+    }
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
+    fn set_baud_rate(&mut self, _baud_rate: u32) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_data_bits(&mut self, _data_bits: serialport::DataBits) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_flow_control(
+        &mut self,
+        _flow_control: serialport::FlowControl,
+    ) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_parity(&mut self, _parity: serialport::Parity) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_stop_bits(&mut self, _stop_bits: serialport::StopBits) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn set_timeout(&mut self, timeout: Duration) -> serialport::Result<()> {
+        self.timeout = timeout;
+        self.stream.set_read_timeout(Some(timeout)).map_err(|e| {
+            serialport::Error::new(serialport::ErrorKind::Io(e.kind()), e.to_string())
+        })
+    }
+    fn write_request_to_send(&mut self, _level: bool) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn write_data_terminal_ready(&mut self, _level: bool) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn read_clear_to_send(&mut self) -> serialport::Result<bool> {
+        Ok(false)
+    }
+    fn read_data_set_ready(&mut self) -> serialport::Result<bool> {
+        Ok(false)
+    }
+    fn read_ring_indicator(&mut self) -> serialport::Result<bool> {
+        Ok(false)
+    }
+    fn read_carrier_detect(&mut self) -> serialport::Result<bool> {
+        Ok(false)
+    }
+    fn bytes_to_read(&self) -> serialport::Result<u32> {
+        Ok(0)
+    }
+    fn bytes_to_write(&self) -> serialport::Result<u32> {
+        Ok(0)
+    }
+    fn clear(&self, _buffer_to_clear: serialport::ClearBuffer) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn try_clone(&self) -> serialport::Result<Box<dyn serialport::SerialPort>> {
+        let stream = self.stream.try_clone().map_err(|e| {
+            serialport::Error::new(serialport::ErrorKind::Io(e.kind()), e.to_string())
+        })?;
+        Ok(Box::new(TcpSerial {
+            stream,
+            addr: self.addr.clone(),
+            timeout: self.timeout,
+        }))
+    }
+    fn set_break(&self) -> serialport::Result<()> {
+        Ok(())
+    }
+    fn clear_break(&self) -> serialport::Result<()> {
+        Ok(())
+    }
+}
+
+/// Run a raw TCP <-> serial bridge so a remote machine can drive this cooler.
+/// One client at a time (the serial port is exclusive); bytes are relayed
+/// verbatim in both directions, so the remote side runs the exact same command
+/// code against a `tcp://` transport. Ctrl-C to stop.
+///
+/// Security: this exposes full control of the cooler to anyone who can reach
+/// `listen`. Bind to a trusted LAN interface (e.g. `192.168.1.50:9600`) or keep
+/// it firewalled; there is no authentication.
+pub fn bridge(port_path: &str, listen: &str) -> Result<()> {
+    let listener = TcpListener::bind(listen)
+        .with_context(|| format!("Failed to bind bridge listener on {listen}"))?;
+    println!("Serial bridge on {listen}  <->  {port_path}");
+    println!("Remote side: tryx_panorama_linux --port tcp://<this-host>:{} <cmd>",
+        listen.rsplit(':').next().unwrap_or("9600"));
+    println!("Waiting for a client (one at a time)...");
+
+    for incoming in listener.incoming() {
+        let stream = match incoming {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("accept failed: {e}");
+                continue;
+            }
+        };
+        let peer = stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "?".into());
+        println!("Client connected: {peer}");
+        if let Err(e) = bridge_session(port_path, stream) {
+            log::warn!("bridge session ended: {e:#}");
+        }
+        println!("Client disconnected: {peer}");
+    }
+    Ok(())
+}
+
+/// Pump bytes both ways for a single connected client until either side closes.
+fn bridge_session(port_path: &str, stream: TcpStream) -> Result<()> {
+    // A short read timeout on both endpoints lets each copy thread notice the
+    // `alive` flag flip and exit promptly when the other direction tears down.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .ok();
+    let serial_to_net = open_port(port_path)?;
+    let net_to_serial = serial_to_net
+        .try_clone()
+        .context("serial try_clone for bridge")?;
+    let net_reader = stream.try_clone().context("tcp try_clone for bridge")?;
+
+    let alive = Arc::new(AtomicBool::new(true));
+
+    // serial -> net
+    let a_alive = alive.clone();
+    let mut serial_rx = serial_to_net;
+    let mut net_tx = stream;
+    let up = thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while a_alive.load(Ordering::Relaxed) {
+            match serial_rx.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => {
+                    if net_tx.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+                Err(_) => break,
+            }
+        }
+        a_alive.store(false, Ordering::Relaxed);
+    });
+
+    // net -> serial (this thread)
+    let mut net_rx = net_reader;
+    let mut serial_tx = net_to_serial;
+    let mut buf = [0u8; 4096];
+    while alive.load(Ordering::Relaxed) {
+        match net_rx.read(&mut buf) {
+            Ok(0) => break, // client closed
+            Ok(n) => {
+                if serial_tx.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    alive.store(false, Ordering::Relaxed);
+    let _ = up.join();
+    Ok(())
 }
 
 /// Read whatever is available on the port, decode frames, return parsed messages.
@@ -663,39 +905,231 @@ pub fn screen(port_path: &str, media: &[String], config: &ScreenConfig) -> Resul
 }
 
 // ============================================================================
-// Simple device controls (forwarded to the HomeUI app on the device)
+// Device controls (forwarded to the HomeUI app on the device)
+//
+// All are POST cmdTypes that get a bare 200 ACK. JSON shapes and enums are from
+// docs/homeui-protocol.md (decompiled MsgReceiverManager + wire captures).
 // ============================================================================
+
+/// Open the port, flush stale input, send one POST command, print replies.
+fn post_json(
+    port_path: &str,
+    cmd_type: &str,
+    value: serde_json::Value,
+    wait_secs: u64,
+) -> Result<()> {
+    let mut port = open_port(port_path)?;
+    let mut dec = FrameDecoder::new();
+    // Drain anything stale so the reply we print correlates with our command
+    pump_incoming(&mut port, &mut dec, false)?;
+    data::send_command(&mut port, cmd_type, &value)?;
+    drain_replies(&mut port, &mut dec, Duration::from_secs(wait_secs))?;
+    Ok(())
+}
 
 /// brightness: 0-100 percent (device maps to 0-250 internally)
 pub fn brightness(port_path: &str, value: u8, wait_secs: u64) -> Result<()> {
     anyhow::ensure!(value <= 100, "brightness is a percentage (0-100)");
-    send(
-        port_path,
-        "POST",
-        "brightness",
-        &serde_json::json!({ "value": value }).to_string(),
-        wait_secs,
-    )
+    post_json(port_path, "brightness", serde_json::json!({ "value": value }), wait_secs)
 }
 
 /// waterBlockScreen: display panel on/off (off = device blanks via brightness 0)
 pub fn screen_power(port_path: &str, on: bool, wait_secs: u64) -> Result<()> {
-    send(
-        port_path,
-        "POST",
-        "waterBlockScreen",
-        &serde_json::json!({ "enable": on }).to_string(),
-        wait_secs,
-    )
+    post_json(port_path, "waterBlockScreen", serde_json::json!({ "enable": on }), wait_secs)
 }
 
-/// displayInSleep: whether the panel stays on while the PC sleeps
+/// displayInSleep: whether the panel shows standby video while the PC sleeps
 pub fn display_in_sleep(port_path: &str, on: bool, wait_secs: u64) -> Result<()> {
-    send(
-        port_path,
-        "POST",
-        "displayInSleep",
-        &serde_json::json!({ "enable": on }).to_string(),
-        wait_secs,
-    )
+    post_json(port_path, "displayInSleep", serde_json::json!({ "enable": on }), wait_secs)
+}
+
+/// power: screen-off/on event. Valid: suspend|shutdown|lock-screen|resume|unlock-screen
+/// (never actually powers Android off — just the panel).
+pub fn power(port_path: &str, event: &str, wait_secs: u64) -> Result<()> {
+    post_json(port_path, "power", serde_json::json!({ "event": event }), wait_secs)
+}
+
+/// temperature: display unit. "Celsius" or "Fahrenheit". Telemetry stays °C;
+/// the device converts for display (and, if Fahrenheit, for the fan curve — so
+/// keep this Celsius unless you also express the fan curve in °F).
+pub fn temperature(port_path: &str, unit: &str, wait_secs: u64) -> Result<()> {
+    post_json(port_path, "temperature", serde_json::json!({ "value": unit }), wait_secs)
+}
+
+/// rotate: sets persist.vendor.orientation. Applies on display re-init/reboot.
+pub fn rotate(port_path: &str, degree: i32, wait_secs: u64) -> Result<()> {
+    post_json(port_path, "rotate", serde_json::json!({ "degree": degree }), wait_secs)
+}
+
+/// disconn: graceful screen-off; the link stays up and any frame restores it.
+pub fn disconn(port_path: &str, wait_secs: u64) -> Result<()> {
+    post_json(port_path, "disconn", serde_json::json!({}), wait_secs)
+}
+
+/// spec: set the CPU/GPU badge title strings. Auto-detects from this machine
+/// when not given. Badge background auto-colors on the vendor substring
+/// (Intel→blue, NVIDIA→green, else red).
+pub fn spec(
+    port_path: &str,
+    cpu: Option<String>,
+    gpu: Option<String>,
+    wait_secs: u64,
+) -> Result<()> {
+    let cpu = cpu.unwrap_or_else(detect_cpu_name);
+    let gpu = gpu.unwrap_or_else(detect_gpu_name);
+    log::info!("spec: cpu={cpu:?} gpu={gpu:?}");
+    post_json(port_path, "spec", serde_json::json!({ "cpu": cpu, "gpu": gpu }), wait_secs)
+}
+
+/// The 13 overlay metrics HomeUI recognizes (case-sensitive).
+pub const SYSINFO_METRICS: &[&str] = &[
+    "CPU Temperature",
+    "GPU Temperature",
+    "CPU Frequency",
+    "GPU Frequency",
+    "CPU Usage",
+    "GPU Usage",
+    "CPU Voltage",
+    "GPU Voltage",
+    "Motherboard Temperature",
+    "Hard Disk Temperature",
+    "Memory Frequency",
+    "Memory Utilization",
+    "Date&Time",
+];
+
+/// sysinfoDisplay: replace the overlay metric list (single-screen flat form).
+pub fn sysinfo_display(port_path: &str, items: &[String], wait_secs: u64) -> Result<()> {
+    for it in items {
+        if !SYSINFO_METRICS.contains(&it.as_str()) {
+            log::warn!(
+                "'{it}' is not a recognized metric (device will ignore it). Valid: {}",
+                SYSINFO_METRICS.join(", ")
+            );
+        }
+    }
+    post_json(port_path, "sysinfoDisplay", serde_json::json!({ "items": items }), wait_secs)
+}
+
+/// fanLCDSet (Smart Mode): temperature→duty curve.
+///
+/// Points are `[[tempC, duty%], …]`. The device's interpolation has two
+/// bytecode-confirmed quirks: the *last* point is never used, and above the
+/// second-to-last point it writes duty 0. Unless `raw`, we append a ceiling
+/// sentinel so your real top point holds instead of dropping to 0 at high temps.
+pub fn fan_smart(
+    port_path: &str,
+    mut points: Vec<(i32, i32)>,
+    raw: bool,
+    wait_secs: u64,
+) -> Result<()> {
+    anyhow::ensure!(!points.is_empty(), "curve needs at least one temp:duty point");
+    points.sort_by_key(|p| p.0);
+    for (_, d) in &points {
+        anyhow::ensure!((0..=100).contains(d), "duty must be 0-100, got {d}");
+    }
+    if !raw {
+        let (last_t, last_d) = *points.last().unwrap();
+        let sentinel_t = (last_t + 30).max(130);
+        points.push((sentinel_t, last_d));
+        log::info!(
+            "Appended ceiling sentinel [{sentinel_t},{last_d}] so {last_d}% holds above {last_t}°C \
+             (device quirk workaround; use --raw to disable)"
+        );
+    }
+    let smart: Vec<Vec<i32>> = points.iter().map(|(t, d)| vec![*t, *d]).collect();
+    let body = serde_json::json!({
+        "speed": "Mid Speed",
+        "fixedMode": 45,
+        "mode": "Smart Mode",
+        "smartMode": smart,
+    });
+    log::info!("fanLCDSet smart curve: {}", serde_json::to_string(&smart)?);
+    post_json(port_path, "fanLCDSet", body, wait_secs)
+}
+
+/// fanLCDSet (Fixed Mode): constant duty percent.
+pub fn fan_fixed(port_path: &str, duty: u8, wait_secs: u64) -> Result<()> {
+    anyhow::ensure!(duty <= 100, "duty is a percentage (0-100)");
+    let body = serde_json::json!({
+        "speed": "Mid Speed",
+        "fixedMode": duty,
+        "mode": "Fixed Mode",
+        "smartMode": serde_json::Value::Null,
+    });
+    post_json(port_path, "fanLCDSet", body, wait_secs)
+}
+
+/// Parse "t1:d1,t2:d2,…" into curve points.
+pub fn parse_curve(s: &str) -> Result<Vec<(i32, i32)>> {
+    s.split(',')
+        .map(|pair| {
+            let (t, d) = pair
+                .split_once(':')
+                .with_context(|| format!("bad curve point '{pair}', expected temp:duty"))?;
+            Ok((
+                t.trim().parse().with_context(|| format!("bad temp in '{pair}'"))?,
+                d.trim().parse().with_context(|| format!("bad duty in '{pair}'"))?,
+            ))
+        })
+        .collect()
+}
+
+fn detect_cpu_name() -> String {
+    std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|c| {
+            c.lines()
+                .find(|l| l.starts_with("model name"))
+                .and_then(|l| l.split(':').nth(1))
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "CPU".to_string())
+}
+
+fn detect_gpu_name() -> String {
+    // Best-effort from lspci's VGA/3D controller line, cleaned up for badge use.
+    if let Ok(out) = Command::new("lspci").output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(line) = text
+                .lines()
+                .find(|l| l.contains("VGA compatible controller") || l.contains("3D controller"))
+            {
+                if let Some(desc) = line.splitn(2, ": ").nth(1) {
+                    return clean_gpu_name(desc.trim());
+                }
+            }
+        }
+    }
+    "GPU".to_string()
+}
+
+/// Trim lspci noise so the badge reads cleanly, while keeping the vendor word
+/// (the device colors the badge by matching "NVIDIA"/"Intel"/else-AMD).
+fn clean_gpu_name(raw: &str) -> String {
+    let mut s = raw.to_string();
+    // Drop a trailing "(rev xx)"
+    if let Some(i) = s.find(" (rev") {
+        s.truncate(i);
+    }
+    // Prefer the marketing name inside the last [...] if present
+    if let (Some(open), Some(close)) = (s.rfind('['), s.rfind(']')) {
+        if close > open {
+            let inner = s[open + 1..close].trim();
+            // First alternative of a "A/B/C" marketing list
+            let first = inner.split('/').next().unwrap_or(inner).trim();
+            let vendor = if raw.contains("NVIDIA") {
+                "NVIDIA "
+            } else if raw.contains("Intel") {
+                "Intel "
+            } else {
+                "AMD "
+            };
+            if !first.is_empty() {
+                return format!("{vendor}{first}");
+            }
+        }
+    }
+    s.trim().to_string()
 }

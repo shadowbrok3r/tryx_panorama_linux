@@ -97,6 +97,14 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         status_every: u64,
     },
+    /// Expose this machine's cooler over TCP so a remote GUI/CLI can control it.
+    /// Run on the box wired to the cooler; the remote side uses --port tcp://host:port.
+    /// One client at a time. No auth — bind to a trusted LAN interface / firewall it.
+    Bridge {
+        /// Address to listen on (host:port). Use 0.0.0.0 for any interface.
+        #[arg(long, default_value = "0.0.0.0:9600")]
+        listen: String,
+    },
     /// Push an image via ADB and configure the display to show it
     Image {
         /// Image file (png/jpg/gif/…)
@@ -141,6 +149,40 @@ enum Cmd {
         #[arg(value_enum)]
         state: Switch,
     },
+    /// Screen-off/on event (never powers Android off, just the panel)
+    Power {
+        #[arg(value_enum)]
+        event: PowerEvent,
+    },
+    /// Set the display temperature unit
+    Temperature {
+        #[arg(value_enum)]
+        unit: TempUnit,
+    },
+    /// Set display rotation (persist.vendor.orientation; may need a device reboot)
+    Rotate {
+        degree: i32,
+    },
+    /// Set the CPU/GPU badge names (auto-detected from this machine if omitted)
+    Spec {
+        #[arg(long)]
+        cpu: Option<String>,
+        #[arg(long)]
+        gpu: Option<String>,
+    },
+    /// Choose which system-info metrics the overlay shows
+    SysinfoDisplay {
+        /// Metric names, e.g. "CPU Temperature" "GPU Usage" "Date&Time"
+        #[arg(required = true, num_args = 1..)]
+        items: Vec<String>,
+    },
+    /// Graceful screen-off (serial link stays up; any command restores it)
+    Disconn,
+    /// Control the LCD/pump fan curve (Smart temperature curve or Fixed duty)
+    Fan {
+        #[command(subcommand)]
+        action: FanAction,
+    },
     /// Launch the desktop GUI (requires building with --features gui)
     Gui,
 }
@@ -155,6 +197,59 @@ impl From<Switch> for bool {
     fn from(s: Switch) -> bool {
         matches!(s, Switch::On)
     }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy)]
+enum TempUnit {
+    Celsius,
+    Fahrenheit,
+}
+
+impl TempUnit {
+    fn as_str(self) -> &'static str {
+        match self {
+            TempUnit::Celsius => "Celsius",
+            TempUnit::Fahrenheit => "Fahrenheit",
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy)]
+enum PowerEvent {
+    Suspend,
+    Shutdown,
+    LockScreen,
+    Resume,
+    UnlockScreen,
+}
+
+impl PowerEvent {
+    fn as_str(self) -> &'static str {
+        match self {
+            PowerEvent::Suspend => "suspend",
+            PowerEvent::Shutdown => "shutdown",
+            PowerEvent::LockScreen => "lock-screen",
+            PowerEvent::Resume => "resume",
+            PowerEvent::UnlockScreen => "unlock-screen",
+        }
+    }
+}
+
+#[derive(clap::Subcommand)]
+enum FanAction {
+    /// Smart temperature→duty curve, e.g. --curve "30:30,50:40,65:55,80:70,90:100"
+    Smart {
+        /// Comma-separated tempC:duty% points (duty 0-100)
+        #[arg(long)]
+        curve: String,
+        /// Don't append a ceiling sentinel (send the curve exactly as given)
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Fixed duty percent (0-100), ignores temperature
+    Fixed {
+        duty: u8,
+    },
 }
 
 #[derive(Args)]
@@ -274,6 +369,7 @@ fn main() -> anyhow::Result<()> {
                     quiet,
                     status_every,
                 } => commands::daemon(&cli.port, interval_ms, conn, quiet, status_every),
+                Cmd::Bridge { listen } => commands::bridge(&cli.port, &listen),
                 Cmd::Image {
                     path,
                     keep_media,
@@ -292,6 +388,19 @@ fn main() -> anyhow::Result<()> {
                 Cmd::DisplayInSleep { state } => {
                     commands::display_in_sleep(&cli.port, state.into(), 2)
                 }
+                Cmd::Power { event } => commands::power(&cli.port, event.as_str(), 2),
+                Cmd::Temperature { unit } => commands::temperature(&cli.port, unit.as_str(), 2),
+                Cmd::Rotate { degree } => commands::rotate(&cli.port, degree, 2),
+                Cmd::Spec { cpu, gpu } => commands::spec(&cli.port, cpu, gpu, 2),
+                Cmd::SysinfoDisplay { items } => commands::sysinfo_display(&cli.port, &items, 2),
+                Cmd::Disconn => commands::disconn(&cli.port, 2),
+                Cmd::Fan { action } => match action {
+                    FanAction::Smart { curve, raw } => {
+                        let points = commands::parse_curve(&curve)?;
+                        commands::fan_smart(&cli.port, points, raw, 2)
+                    }
+                    FanAction::Fixed { duty } => commands::fan_fixed(&cli.port, duty, 2),
+                },
                 Cmd::Gui => unreachable!(),
             }
         }

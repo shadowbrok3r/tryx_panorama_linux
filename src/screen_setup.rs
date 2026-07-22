@@ -133,12 +133,13 @@ impl AioCoolerController {
     }
 
     fn open_port(&self) -> Result<Box<dyn serialport::SerialPort>> {
-        log::info!("Opening serial port: {}", self.serial_device);
+        log::info!("Opening device transport: {}", self.serial_device);
 
-        let port = serialport::new(&self.serial_device, 115200)
-            .timeout(Duration::from_secs(2))
-            .open()
-            .context("Failed to open serial port")?;
+        // Delegate to the shared opener so a `tcp://host:port` device string
+        // transparently uses the network bridge (remote GUI/CLI over the LAN).
+        let mut port = crate::commands::open_port(&self.serial_device)?;
+        port.set_timeout(Duration::from_secs(2))
+            .context("Failed to set serial timeout")?;
 
         // Clear buffers
         thread::sleep(Duration::from_millis(100));

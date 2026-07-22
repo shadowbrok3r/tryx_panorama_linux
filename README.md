@@ -24,12 +24,24 @@ cargo build --release
 | `image <file> [config flags]` | Full upload flow: `transport` → ADB push → `transported` → `mediaDelete` → `waterBlockScreenId` |
 | `screen <media>... [config flags]` | Reconfigure the screen for media already on the device |
 | `pump --enable --value 65` | Turbo pump control |
+| `fan smart --curve "30:30,50:40,…"` / `fan fixed <duty>` | LCD/pump fan curve (temp→duty) or fixed duty |
 | `brightness <0-100>` | Display brightness (device maps to 0-250 internally) |
 | `screen-power on\|off` | Display panel on/off |
 | `display-in-sleep on\|off` | Keep panel on while the PC sleeps |
+| `power suspend\|shutdown\|lock-screen\|resume\|unlock-screen` | Screen-off/on event (panel only, not Android) |
+| `temperature celsius\|fahrenheit` | Display temperature unit |
+| `spec [--cpu <name>] [--gpu <name>]` | CPU/GPU badge names (auto-detected from this machine) |
+| `sysinfo-display "<metric>"...` | Which overlay metrics to show (13 recognized, see `--help`) |
+| `rotate <degree>` | Display orientation (persist.vendor.orientation; may need reboot) |
+| `disconn` | Graceful screen-off (link stays up) |
+| `bridge [--listen 0.0.0.0:9600]` | Relay serial over TCP so a remote GUI/CLI (`--port tcp://host:9600`) can control this cooler — see [Remote control](#remote-control-over-the-lan) |
 | `gui` | Desktop app (only with `cargo build --features gui`) |
 
-Config flags for `image`/`screen`: `--screen-mode`, `--play-mode` (Single/Loop), `--ratio`, `--color`, `--align` (Left/Center/Right), `--filter` (Rain/Smoke), `--filter-opacity`, `--badges`, `--sysinfo-display`.
+Config flags for `image`/`screen`: `--screen-mode`, `--play-mode` (Single/Loop/Shuffle), `--ratio`, `--color`, `--align` (Left/Center/Right), `--filter` (Rain/Smoke), `--filter-opacity`, `--badges`, `--sysinfo-display`.
+
+The device runs two apps: **SerialService** (framing, `conn`/`transport`/`mediaDelete`/`turboPump`) and **HomeUI** (rendering + most controls: `brightness`/`spec`/`fanLCDSet`/`sysinfoDisplay`/…). The full reverse-engineered command reference — all 16 HomeUI cmdTypes with exact JSON, enums, the fan-curve algorithm, and its quirks — is in [`docs/homeui-protocol.md`](docs/homeui-protocol.md).
+
+> **Fan curve quirks** (from the decompiled interpolation, confirmed on hardware): the device never uses the *last* curve point and writes duty 0 above the second-to-last point. `fan smart` auto-appends a ceiling sentinel so your real top point holds at high temps; pass `--raw` to send the curve verbatim. The curve is applied on every `all` frame using the CPU temperature we stream — so the `daemon` must be running for it to react.
 
 Global flags: `-p/--port <dev>` (default `/dev/ttyACM0`), `-v/-vv` verbosity.
 
@@ -203,6 +215,35 @@ journalctl -u tryx-panorama.service -f
 ```
 
 The unit targets `/dev/tryx0` (the stable symlink from the udev rule above) and runs as root so CPU power works. It documents a least-privilege alternative (a `dialout` user, with `cpu.power` then reporting 0) inline.
+
+### Remote control over the LAN
+
+The cooler is wired (USB serial + ADB) to one machine, but you can drive it — including the **desktop GUI** — from another machine on the same network. Both device channels are tunneled over TCP:
+
+- **Serial** → the `bridge` subcommand relays a `tcp://host:port` connection to the local serial port, byte-for-byte. Anywhere the tool takes `--port /dev/tryx0`, a remote client passes `--port tcp://host:9600` instead. The GUI's *Serial Device* field takes the same `tcp://` string.
+- **ADB** (image push) → adb's own shared-server mode. A USB device can be claimed by only one adb server, so the bridged machine runs the *only* adb server, listening on all interfaces; the remote sets `ADB_SERVER_SOCKET`.
+
+One helper starts both:
+
+```bash
+# On the machine wired to the cooler:
+BIN=/usr/local/bin/tryx_panorama_linux packaging/remote-bridge.sh
+#   → serial bridge on 0.0.0.0:9600, shared adb on 0.0.0.0:5037
+#   → prints the exact desktop-side commands with this host's IP
+```
+
+```bash
+# On your desktop:
+export ADB_SERVER_SOCKET=tcp:<host-ip>:5037
+tryx_panorama_linux                                  # GUI: set Serial Device = tcp://<host-ip>:9600
+tryx_panorama_linux --port tcp://<host-ip>:9600 spec # or any CLI command
+```
+
+Only the two commands need the bridge host; the file to display lives on the desktop and `adb push` streams it across. Notes:
+
+- **One serial client at a time** — the port is exclusive, so a remote session and the local `daemon` can't both hold it. Stop the daemon while driving the cooler remotely (the smart fan curve only reacts while *some* client streams sysinfo).
+- **No authentication** on either channel — anyone who can reach the ports gets full control of the cooler and adb to the Android board. Run it only on a trusted LAN, set `BIND_ADDR` to a specific interface, or firewall ports 9600/5037.
+- Manual equivalent, without the script: `tryx_panorama_linux --port /dev/tryx0 bridge --listen 0.0.0.0:9600` for serial, plus `adb kill-server && adb -a nodaemon server` for adb.
 
 `waterBlockScreenId` body:
 
