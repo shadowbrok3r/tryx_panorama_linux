@@ -1,42 +1,107 @@
+// ============================================================================
+// GUI application state + the background-work plumbing every control uses.
+// ============================================================================
 
+use std::path::PathBuf;
+
+use crossbeam::channel::{Receiver, Sender};
+
+use crate::gallery::{self, Gallery};
 
 #[derive(Debug)]
 pub enum AppMessage {
-    Log(String),
-    Progress(f32, String),
     Success(String),
     Error(String),
+    /// A worker fetched the device's media list.
+    DeviceMedia(Vec<String>),
+    /// A gallery-mutating action finished; reload the working copy from disk.
+    GalleryChanged,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum Tab {
+    Gallery,
+    Display,
+    FanPump,
+    System,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum FanMode {
+    Smart,
+    Fixed,
 }
 
 /// Main App Structure
 pub struct AioCoolerApp {
-
+    // Connection / persistence
     pub serial_device: String,
-    pub selected_image: Option<std::path::PathBuf>,
-    pub screen_config: crate::screen_setup::ScreenConfig,
+    pub gallery_path: PathBuf,
 
+    // Working copies (the GUI's source of truth; pushed to the device on Apply)
+    pub gallery: Gallery, // media order + play_mode + display config
+    pub device_media: Vec<String>, // last adb-listed files (Gallery tab)
 
+    // Gallery tab
+    pub selected_image: Option<PathBuf>,
+    pub replace_on_upload: bool,
+
+    // Fan & Pump tab
+    pub fan_mode: FanMode,
+    pub fan_curve: Vec<(i32, i32)>,
+    pub fan_raw: bool,
+    pub fan_fixed_duty: u8,
+    pub pump_enable: bool,
+    pub pump_value: u32,
+
+    // System tab
+    pub brightness: u8,
+    pub rotate_degree: i32,
+    pub temp_fahrenheit: bool,
+    pub cpu_name: String,
+    pub gpu_name: String,
+    pub power_event: String,
+    pub display_in_sleep: bool,
+
+    // UI
+    pub current_tab: Tab,
     pub is_processing: bool,
     pub progress: f32,
     pub status_message: String,
-    pub log_messages: Vec<String>,
 
-
-    pub message_sender: Option<crossbeam::channel::Sender<AppMessage>>,
-    pub message_receiver: crossbeam::channel::Receiver<AppMessage>,
+    pub message_sender: Option<Sender<AppMessage>>,
+    pub message_receiver: Receiver<AppMessage>,
 }
 
 impl Default for AioCoolerApp {
     fn default() -> Self {
         let (tx, rx) = crossbeam::channel::unbounded();
+        let gallery_path = Gallery::resolve_path(None);
+        let gallery = Gallery::load(&gallery_path).unwrap_or_default();
         Self {
             serial_device: "/dev/ttyACM0".to_string(),
+            gallery_path,
+            gallery,
+            device_media: Vec::new(),
             selected_image: None,
-            screen_config: crate::screen_setup::ScreenConfig::default(),
+            replace_on_upload: false,
+            fan_mode: FanMode::Smart,
+            fan_curve: vec![(30, 30), (50, 40), (65, 55), (80, 70), (90, 100)],
+            fan_raw: false,
+            fan_fixed_duty: 45,
+            pump_enable: false,
+            pump_value: 65,
+            brightness: 100,
+            rotate_degree: 0,
+            temp_fahrenheit: false,
+            cpu_name: crate::commands::detect_cpu_name(),
+            gpu_name: crate::commands::detect_gpu_name(),
+            power_event: "suspend".to_string(),
+            display_in_sleep: false,
+            current_tab: Tab::Gallery,
             is_processing: false,
             progress: 0.0,
             status_message: "Ready".to_string(),
-            log_messages: Vec::new(),
             message_sender: Some(tx),
             message_receiver: rx,
         }
@@ -47,16 +112,6 @@ impl AioCoolerApp {
     pub fn process_messages(&mut self) {
         while let Ok(msg) = self.message_receiver.try_recv() {
             match msg {
-                AppMessage::Log(text) => {
-                    self.log_messages.push(text);
-                    if self.log_messages.len() > 100 {
-                        self.log_messages.remove(0);
-                    }
-                }
-                AppMessage::Progress(progress, status) => {
-                    self.progress = progress;
-                    self.status_message = status;
-                }
                 AppMessage::Success(msg) => {
                     self.is_processing = false;
                     self.progress = 1.0;
@@ -65,74 +120,55 @@ impl AioCoolerApp {
                 AppMessage::Error(msg) => {
                     self.is_processing = false;
                     self.progress = 0.0;
-                    self.status_message = format!("Error: {}", msg);
+                    self.status_message = format!("Error: {msg}");
+                    log::error!("{msg}");
+                }
+                AppMessage::DeviceMedia(media) => {
+                    self.device_media = media;
+                }
+                AppMessage::GalleryChanged => {
+                    // Reload media/play_mode from disk; display config is edited
+                    // live in self.gallery.config and was already persisted by
+                    // the action that fired this, so a reload stays consistent.
+                    if let Ok(g) = Gallery::load(&self.gallery_path) {
+                        self.gallery = g;
+                    }
                 }
             }
         }
     }
 
-    pub fn start_transfer(&mut self) {
+    /// Spawn a background action, serialized by `is_processing` (the serial port
+    /// is exclusive). The closure gets a `Sender` so it can emit progress /
+    /// device-media / gallery-changed messages; its `Result` becomes Success/Error.
+    pub fn spawn_action<F>(&mut self, status: impl Into<String>, work: F)
+    where
+        F: FnOnce(Sender<AppMessage>) -> anyhow::Result<()> + Send + 'static,
+    {
         if self.is_processing {
             return;
         }
-
-        let Some(image_path) = self.selected_image.clone() else {
-            self.status_message = "No image selected".to_string();
-            return;
-        };
-
         self.is_processing = true;
         self.progress = 0.0;
-        self.status_message = "Starting transfer...".to_string();
-
-        let serial_device = self.serial_device.clone();
-        let config = self.screen_config.clone();
+        self.status_message = status.into();
         let tx = self.message_sender.clone().unwrap();
-
-        std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<(), anyhow::Error> {
-                let _ = tx.send(AppMessage::Progress(0.1, "Calculating MD5...".to_string()));
-                let _ = tx.send(AppMessage::Log("Calculating file MD5...".to_string()));
-
-                let file_md5 = crate::screen_setup::AioCoolerController::calculate_md5(&image_path)?;
-                let file_size = std::fs::metadata(&image_path)?.len();
-
-                let extension = image_path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("png");
-                let remote_name = crate::screen_setup::AioCoolerController::generate_filename(extension);
-
-                let _ = tx.send(AppMessage::Log(format!(
-                    "File: {} ({} bytes, MD5: {})",
-                    image_path.display(),
-                    file_size,
-                    file_md5
-                )));
-
-                let _ = tx.send(AppMessage::Progress(0.2, "Pushing to device via ADB...".to_string()));
-                let _ = tx.send(AppMessage::Log("Starting ADB push...".to_string()));
-
-                let controller = crate::screen_setup::AioCoolerController::new(&serial_device);
-                controller.adb_push(&image_path, &remote_name)?;
-
-                let _ = tx.send(AppMessage::Progress(0.5, "Sending serial commands...".to_string()));
-                let _ = tx.send(AppMessage::Log("Sending serial commands...".to_string()));
-
-                controller.send_image_commands(&remote_name, file_size, &file_md5, &config)?;
-
-                let _ = tx.send(AppMessage::Log("Transfer complete!".to_string()));
-                Ok(())
-            })();
-
-            match result {
-                Ok(()) => {
-                    let _ = tx.send(AppMessage::Success("Transfer complete!".to_string()));
-                }
-                Err(e) => {
-                    let _ = tx.send(AppMessage::Error(format!("{:#}", e)));
-                }
+        let tx_work = tx.clone();
+        std::thread::spawn(move || match work(tx_work) {
+            Ok(()) => {
+                let _ = tx.send(AppMessage::Success("Done".to_string()));
             }
+            Err(e) => {
+                let _ = tx.send(AppMessage::Error(format!("{e:#}")));
+            }
+        });
+    }
+
+    /// Refresh the device media list (adb) in the background.
+    pub fn refresh_device_media(&mut self) {
+        self.spawn_action("Listing device media…", move |tx| {
+            let media = gallery::list_device_media()?;
+            let _ = tx.send(AppMessage::DeviceMedia(media));
+            Ok(())
         });
     }
 }

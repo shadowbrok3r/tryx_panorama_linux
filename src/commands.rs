@@ -5,7 +5,7 @@
 use std::{
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -18,6 +18,7 @@ use std::{
 use anyhow::{Context, Result};
 
 use crate::data::{self, FrameDecoder, ParsedMessage};
+use crate::gallery::{self, Gallery};
 use crate::screen_setup::{AioCoolerController, ScreenConfig};
 use crate::sysinfo::{SysInfo, SysInfoReader};
 
@@ -675,6 +676,8 @@ pub fn daemon(
     do_conn: bool,
     quiet: bool,
     status_every: u64,
+    gallery_path: &Path,
+    no_gallery: bool,
 ) -> Result<()> {
     let running = install_signal_handler();
     let mut reader = SysInfoReader::new();
@@ -709,6 +712,24 @@ pub fn daemon(
                         log::info!("Device: {}", m.body.trim());
                     }
                 }
+            }
+        }
+
+        // Re-apply the persistent gallery on every (re)connect so the display
+        // survives reboots and the device's 60s watchdog. Reloaded each time so
+        // CLI/GUI edits are picked up on the next reconnect.
+        if !no_gallery {
+            match Gallery::load(gallery_path) {
+                Ok(g) if !g.media.is_empty() => match send_gallery_on(&mut port, &mut dec, &g) {
+                    Ok(()) => log::info!(
+                        "Applied gallery: {} image(s) [{}]",
+                        g.media.len(),
+                        g.effective_play_mode()
+                    ),
+                    Err(e) => log::warn!("gallery apply failed: {e:#}"),
+                },
+                Ok(_) => {} // empty gallery: nothing to restore
+                Err(e) => log::warn!("gallery load failed ({}): {e:#}", gallery_path.display()),
             }
         }
 
@@ -814,86 +835,124 @@ fn drain_replies(
 
 /// Full upload flow, mirroring the Windows app exactly (from logcat captures):
 /// sysinfo → `transport` (announce) → ADB push (the actual bytes; they never
-/// cross the serial link) → `transported` (commit) → `mediaDelete` (prune) →
-/// `waterBlockScreenId` (configure) → 1 Hz sysinfo keepalives.
-pub fn image(port_path: &str, path: &PathBuf, config: &ScreenConfig, keep_media: bool) -> Result<()> {
-    anyhow::ensure!(path.is_file(), "No such file: {}", path.display());
-
-    let controller = AioCoolerController::new(port_path);
-    let file_md5 = AioCoolerController::calculate_md5(path)?;
+/// cross the serial link) → `transported` (commit). Returns the device
+/// filename. Does NOT touch the playlist/config — callers decide gallery
+/// semantics (accumulate vs replace).
+fn upload_file(
+    port: &mut Box<dyn serialport::SerialPort>,
+    dec: &mut FrameDecoder,
+    controller: &AioCoolerController,
+    path: &Path,
+) -> Result<String> {
+    let path_buf = path.to_path_buf();
+    let file_md5 = AioCoolerController::calculate_md5(&path_buf)?;
     let file_size = std::fs::metadata(path)?.len();
-    let extension = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("png");
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("png");
     let remote_name = AioCoolerController::generate_filename(extension);
 
     log::info!(
-        "File: {} ({} bytes, MD5 {}) → {}",
-        path.display(),
-        file_size,
-        file_md5,
-        remote_name
+        "File: {} ({file_size} bytes, MD5 {file_md5}) → {remote_name}",
+        path.display()
     );
 
-    let mut port = open_port(port_path)?;
-    let mut dec = FrameDecoder::new();
-
     // Establish traffic (device resets its port after 10s of RX silence)
-    data::send_state_command(&mut port, "all", &serde_json::to_value(SysInfo::get_sysinfo())?)?;
-    drain_replies(&mut port, &mut dec, Duration::from_millis(300))?;
+    data::send_state_command(port, "all", &serde_json::to_value(SysInfo::get_sysinfo())?)?;
+    drain_replies(port, dec, Duration::from_millis(300))?;
 
     // 1. Announce the transfer (device opens/truncates the target file)
     data::send_command(
-        &mut port,
+        port,
         "transport",
-        &serde_json::json!({
-            "type": "media",
-            "fileSize": file_size,
-            "fileName": remote_name
-        }),
+        &serde_json::json!({ "type": "media", "fileSize": file_size, "fileName": remote_name }),
     )?;
-    drain_replies(&mut port, &mut dec, Duration::from_millis(500))?;
+    drain_replies(port, dec, Duration::from_millis(500))?;
 
     // 2. Actual bytes go over ADB (the Windows app does the same — its serial
     //    md5 is literally the string "todo"; we send the real one, also unchecked)
-    controller.adb_push(path, &remote_name)?;
+    controller.adb_push(&path_buf, &remote_name)?;
 
     // 3. Commit
     data::send_command(
-        &mut port,
+        port,
         "transported",
         &serde_json::json!({ "md5": file_md5, "fileName": remote_name }),
     )?;
-    drain_replies(&mut port, &mut dec, Duration::from_millis(500))?;
+    drain_replies(port, dec, Duration::from_millis(500))?;
 
-    // 4. Prune old media, 5. configure the screen (the app always pairs these)
-    if keep_media {
-        log::info!("--keep-media: skipping mediaDelete");
-    } else {
+    Ok(remote_name)
+}
+
+/// Send the gallery's playlist + display settings on an already-open port.
+/// Used by upload/apply here and by the daemon (which owns its own port).
+fn send_gallery_on(
+    port: &mut Box<dyn serialport::SerialPort>,
+    dec: &mut FrameDecoder,
+    gallery: &Gallery,
+) -> Result<()> {
+    let mut cfg = gallery.config.clone();
+    cfg.play_mode = gallery.effective_play_mode().to_string();
+    data::send_command(port, "waterBlockScreenId", &cfg.to_water_block_json(&gallery.media))?;
+    drain_replies(port, dec, Duration::from_millis(400))?;
+    Ok(())
+}
+
+/// A few sysinfo ticks so temps populate and the link stays up after a config push.
+fn keepalive_ticks(
+    port: &mut Box<dyn serialport::SerialPort>,
+    dec: &mut FrameDecoder,
+    n: u32,
+) -> Result<()> {
+    for _ in 0..n {
+        thread::sleep(Duration::from_millis(800));
+        data::send_state_command(port, "all", &serde_json::to_value(SysInfo::get_sysinfo())?)?;
+        drain_replies(port, dec, Duration::from_millis(200))?;
+    }
+    Ok(())
+}
+
+/// Upload an image and show it. Default is **accumulate**: the new file joins
+/// the persistent gallery playlist (nothing is deleted) and the whole playlist
+/// is (re)displayed. `replace` restores the old behavior — wipe every other
+/// file and show only this one. `config` becomes the gallery's display settings.
+pub fn image(
+    port_path: &str,
+    path: &PathBuf,
+    config: &ScreenConfig,
+    gallery_path: &Path,
+    replace: bool,
+) -> Result<()> {
+    anyhow::ensure!(path.is_file(), "No such file: {}", path.display());
+
+    let controller = AioCoolerController::new(port_path);
+    let mut port = open_port(port_path)?;
+    let mut dec = FrameDecoder::new();
+
+    let remote_name = upload_file(&mut port, &mut dec, &controller, path)?;
+
+    let mut gallery = Gallery::load(gallery_path)?;
+    if replace {
+        // Prune every other file, show just this one.
         data::send_command(
             &mut port,
             "mediaDelete",
             &serde_json::json!({ "type": "custom", "exclude": [remote_name] }),
         )?;
         drain_replies(&mut port, &mut dec, Duration::from_millis(300))?;
+        gallery.media = vec![remote_name.clone()];
+    } else {
+        gallery.add(remote_name.clone());
     }
+    gallery.config = config.clone();
+    gallery.save(gallery_path)?;
 
-    data::send_command(
-        &mut port,
-        "waterBlockScreenId",
-        &config.to_water_block_json(&[remote_name.clone()]),
-    )?;
-    drain_replies(&mut port, &mut dec, Duration::from_millis(500))?;
+    send_gallery_on(&mut port, &mut dec, &gallery)?;
+    keepalive_ticks(&mut port, &mut dec, 5)?;
 
-    // 6. A few sysinfo ticks so temps populate and the link stays up
-    for _ in 0..5 {
-        thread::sleep(Duration::from_millis(1000));
-        data::send_state_command(&mut port, "all", &serde_json::to_value(SysInfo::get_sysinfo())?)?;
-        drain_replies(&mut port, &mut dec, Duration::from_millis(200))?;
-    }
-
-    println!("Transfer complete: {remote_name}");
+    println!(
+        "Displayed {} image(s) [{}]; newest: {remote_name}",
+        gallery.media.len(),
+        gallery.effective_play_mode()
+    );
     Ok(())
 }
 
@@ -901,6 +960,151 @@ pub fn screen(port_path: &str, media: &[String], config: &ScreenConfig) -> Resul
     let controller = AioCoolerController::new(port_path);
     controller.send_screen_config(media, config)?;
     println!("Screen configuration sent.");
+    Ok(())
+}
+
+// ============================================================================
+// gallery — persistent, accumulating image playlist
+// ============================================================================
+
+/// Re-send the saved gallery playlist to the device now (manual restore).
+pub fn apply_gallery(port_path: &str, gallery_path: &Path) -> Result<()> {
+    let gallery = Gallery::load(gallery_path)?;
+    let mut port = open_port(port_path)?;
+    let mut dec = FrameDecoder::new();
+    // Prime the link before the config push.
+    data::send_state_command(&mut port, "all", &serde_json::to_value(SysInfo::get_sysinfo())?)?;
+    drain_replies(&mut port, &mut dec, Duration::from_millis(300))?;
+    send_gallery_on(&mut port, &mut dec, &gallery)?;
+    keepalive_ticks(&mut port, &mut dec, 3)?;
+    println!(
+        "Applied gallery: {} image(s) [{}]",
+        gallery.media.len(),
+        gallery.effective_play_mode()
+    );
+    Ok(())
+}
+
+/// Persist an explicit gallery (playlist order + play mode + display config)
+/// and push it to the device. Used by the GUI, whose in-memory gallery is the
+/// source of truth, rather than reading from disk first.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn gallery_write_apply(port_path: &str, gallery: &Gallery, gallery_path: &Path) -> Result<()> {
+    gallery.save(gallery_path)?;
+    let mut port = open_port(port_path)?;
+    let mut dec = FrameDecoder::new();
+    data::send_state_command(&mut port, "all", &serde_json::to_value(SysInfo::get_sysinfo())?)?;
+    drain_replies(&mut port, &mut dec, Duration::from_millis(300))?;
+    send_gallery_on(&mut port, &mut dec, gallery)?;
+    keepalive_ticks(&mut port, &mut dec, 3)?;
+    Ok(())
+}
+
+/// Add an image to the gallery without changing its display settings.
+pub fn gallery_add(port_path: &str, path: &PathBuf, gallery_path: &Path) -> Result<()> {
+    let gallery = Gallery::load(gallery_path)?;
+    image(port_path, path, &gallery.config, gallery_path, false)
+}
+
+/// List device media, annotated with playlist position / foreign status.
+pub fn gallery_list(gallery_path: &Path) -> Result<()> {
+    let gallery = Gallery::load(gallery_path)?;
+    let device = gallery::list_device_media()?;
+
+    println!(
+        "Gallery ({} in playlist, play mode: {}):",
+        gallery.media.len(),
+        gallery.effective_play_mode()
+    );
+    if gallery.media.is_empty() {
+        println!("  (empty)");
+    }
+    for (i, name) in gallery.media.iter().enumerate() {
+        let on_device = if device.iter().any(|d| d == name) { "" } else { "  [MISSING on device]" };
+        println!("  {}. {name}{on_device}", i + 1);
+    }
+
+    let extras: Vec<&String> = device.iter().filter(|d| !gallery.contains(d)).collect();
+    if !extras.is_empty() {
+        println!("\nOn device but not in playlist:");
+        for name in extras {
+            let kind = if gallery::is_our_upload(name) { "upload" } else { "foreign" };
+            println!("  {name}  ({kind})");
+        }
+    }
+    Ok(())
+}
+
+/// Remove one image: delete its file on the device and drop it from the playlist.
+pub fn gallery_rm(port_path: &str, name: &str, gallery_path: &Path) -> Result<()> {
+    let mut gallery = Gallery::load(gallery_path)?;
+    let was_in_playlist = gallery.remove(name);
+
+    let mut port = open_port(port_path)?;
+    let mut dec = FrameDecoder::new();
+    data::send_state_command(&mut port, "all", &serde_json::to_value(SysInfo::get_sysinfo())?)?;
+    drain_replies(&mut port, &mut dec, Duration::from_millis(300))?;
+    // Delete ONLY this file (the doc's `include` form).
+    data::send_command(
+        &mut port,
+        "mediaDelete",
+        &serde_json::json!({ "type": "custom", "include": [name] }),
+    )?;
+    drain_replies(&mut port, &mut dec, Duration::from_millis(300))?;
+
+    gallery.save(gallery_path)?;
+    send_gallery_on(&mut port, &mut dec, &gallery)?;
+    keepalive_ticks(&mut port, &mut dec, 3)?;
+
+    println!(
+        "Removed {name}{}. {} image(s) remain.",
+        if was_in_playlist { "" } else { " (was not in playlist)" },
+        gallery.media.len()
+    );
+    Ok(())
+}
+
+/// Delete all of *our* uploads (keeps foreign files) and empty the playlist.
+pub fn gallery_clear(port_path: &str, gallery_path: &Path) -> Result<()> {
+    let ours: Vec<String> = gallery::list_device_media()?
+        .into_iter()
+        .filter(|f| gallery::is_our_upload(f))
+        .collect();
+
+    let mut port = open_port(port_path)?;
+    let mut dec = FrameDecoder::new();
+    data::send_state_command(&mut port, "all", &serde_json::to_value(SysInfo::get_sysinfo())?)?;
+    drain_replies(&mut port, &mut dec, Duration::from_millis(300))?;
+    if !ours.is_empty() {
+        data::send_command(
+            &mut port,
+            "mediaDelete",
+            &serde_json::json!({ "type": "custom", "include": ours }),
+        )?;
+        drain_replies(&mut port, &mut dec, Duration::from_millis(300))?;
+    }
+
+    let mut gallery = Gallery::load(gallery_path)?;
+    gallery.media.clear();
+    gallery.save(gallery_path)?;
+    // Empty playlist → device shows nothing; push so the screen updates.
+    send_gallery_on(&mut port, &mut dec, &gallery)?;
+
+    println!("Cleared {} upload(s); foreign files kept.", ours.len());
+    Ok(())
+}
+
+/// Set the play mode ("Single" | "Loop" | "Shuffle") and re-apply.
+pub fn gallery_mode(port_path: &str, mode: &str, gallery_path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        matches!(mode, "Single" | "Loop" | "Shuffle"),
+        "play mode must be Single, Loop, or Shuffle (got {mode:?})"
+    );
+    let mut gallery = Gallery::load(gallery_path)?;
+    gallery.play_mode = mode.to_string();
+    gallery.save(gallery_path)?;
+    apply_gallery(port_path, gallery_path)?;
+    println!("Play mode set to {mode}.");
     Ok(())
 }
 
@@ -1075,7 +1279,7 @@ pub fn parse_curve(s: &str) -> Result<Vec<(i32, i32)>> {
         .collect()
 }
 
-fn detect_cpu_name() -> String {
+pub(crate) fn detect_cpu_name() -> String {
     std::fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|c| {
@@ -1087,7 +1291,7 @@ fn detect_cpu_name() -> String {
         .unwrap_or_else(|| "CPU".to_string())
 }
 
-fn detect_gpu_name() -> String {
+pub(crate) fn detect_gpu_name() -> String {
     // Best-effort from lspci's VGA/3D controller line, cleaned up for badge use.
     if let Ok(out) = Command::new("lspci").output() {
         if out.status.success() {

@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand};
 mod app_state;
 mod commands;
 mod data;
+mod gallery;
 #[cfg(feature = "gui")]
 mod gui;
 mod screen_setup;
@@ -29,6 +30,11 @@ struct Cli {
     /// Increase log verbosity (-v debug, -vv trace)
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Gallery state file (default: $XDG_CONFIG_HOME/tryx-panorama/gallery.json,
+    /// or $TRYX_GALLERY). CLI, GUI, and daemon must share the same path.
+    #[arg(long, global = true)]
+    gallery_file: Option<String>,
 
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -96,6 +102,9 @@ enum Cmd {
         /// Print a status line every N ticks (0 = never)
         #[arg(long, default_value_t = 10)]
         status_every: u64,
+        /// Don't re-apply the saved gallery on (re)connect
+        #[arg(long)]
+        no_gallery: bool,
     },
     /// Expose this machine's cooler over TCP so a remote GUI/CLI can control it.
     /// Run on the box wired to the cooler; the remote side uses --port tcp://host:port.
@@ -105,15 +114,24 @@ enum Cmd {
         #[arg(long, default_value = "0.0.0.0:9600")]
         listen: String,
     },
-    /// Push an image via ADB and configure the display to show it
+    /// Upload an image and add it to the persistent gallery (accumulates by
+    /// default — nothing is deleted; the whole playlist is re-displayed)
     Image {
         /// Image file (png/jpg/gif/…)
         path: PathBuf,
-        /// Skip the mediaDelete step (keep existing files on the device)
+        /// Replace: wipe every other file and show only this one (old behavior)
         #[arg(long)]
+        replace: bool,
+        /// Deprecated no-op: keeping media is now the default (accepted for compat)
+        #[arg(long, hide = true)]
         keep_media: bool,
         #[command(flatten)]
         config: ScreenConfigArgs,
+    },
+    /// Manage the persistent image gallery (accumulating playlist)
+    Gallery {
+        #[command(subcommand)]
+        action: GalleryAction,
     },
     /// Configure the display for media already on the device (no upload)
     Screen {
@@ -252,6 +270,32 @@ enum FanAction {
     },
 }
 
+#[derive(clap::Subcommand)]
+enum GalleryAction {
+    /// List device media, annotated with playlist position / foreign status
+    List,
+    /// Upload an image and append it to the playlist (keeps current settings)
+    Add {
+        /// Image file (png/jpg/gif/…)
+        path: PathBuf,
+    },
+    /// Remove one image: delete its file and drop it from the playlist
+    Rm {
+        /// Device file name (as shown by `gallery list`)
+        name: String,
+    },
+    /// Delete all of our uploads (keeps foreign files) and empty the playlist
+    Clear,
+    /// Re-send the saved gallery to the device now
+    Apply,
+    /// Set the play mode and re-apply
+    Mode {
+        /// Single | Loop | Shuffle
+        #[arg(value_parser = ["Single", "Loop", "Shuffle"])]
+        mode: String,
+    },
+}
+
 #[derive(Args)]
 struct ScreenConfigArgs {
     /// "Full Screen" (or "Screen Splitting" — not supported yet)
@@ -344,6 +388,7 @@ fn main() -> anyhow::Result<()> {
         }
         cmd => {
             init_cli_logging(cli.verbose);
+            let gallery_path = gallery::Gallery::resolve_path(cli.gallery_file.as_deref());
             match cmd {
                 Cmd::Detect => commands::detect(),
                 Cmd::Conn { retries } => commands::conn(&cli.port, retries),
@@ -368,13 +413,43 @@ fn main() -> anyhow::Result<()> {
                     conn,
                     quiet,
                     status_every,
-                } => commands::daemon(&cli.port, interval_ms, conn, quiet, status_every),
+                    no_gallery,
+                } => commands::daemon(
+                    &cli.port,
+                    interval_ms,
+                    conn,
+                    quiet,
+                    status_every,
+                    &gallery_path,
+                    no_gallery,
+                ),
                 Cmd::Bridge { listen } => commands::bridge(&cli.port, &listen),
                 Cmd::Image {
                     path,
-                    keep_media,
+                    replace,
+                    keep_media: _,
                     config,
-                } => commands::image(&cli.port, &path, &ScreenConfig::from(&config), keep_media),
+                } => commands::image(
+                    &cli.port,
+                    &path,
+                    &ScreenConfig::from(&config),
+                    &gallery_path,
+                    replace,
+                ),
+                Cmd::Gallery { action } => match action {
+                    GalleryAction::List => commands::gallery_list(&gallery_path),
+                    GalleryAction::Add { path } => {
+                        commands::gallery_add(&cli.port, &path, &gallery_path)
+                    }
+                    GalleryAction::Rm { name } => {
+                        commands::gallery_rm(&cli.port, &name, &gallery_path)
+                    }
+                    GalleryAction::Clear => commands::gallery_clear(&cli.port, &gallery_path),
+                    GalleryAction::Apply => commands::apply_gallery(&cli.port, &gallery_path),
+                    GalleryAction::Mode { mode } => {
+                        commands::gallery_mode(&cli.port, &mode, &gallery_path)
+                    }
+                },
                 Cmd::Screen { media, config } => {
                     commands::screen(&cli.port, &media, &ScreenConfig::from(&config))
                 }

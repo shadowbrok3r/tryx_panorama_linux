@@ -147,48 +147,6 @@ impl AioCoolerController {
         Ok(port)
     }
 
-    /// Send screen configuration command with sysinfo to keep connection alive.
-    /// Skip transport/transported commands for now because those expect file data over serial.
-    /// (GUI transfer path; the CLI uses the full announce/commit flow in commands.rs)
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
-    pub fn send_image_commands(
-        &self,
-        file_name: &str,
-        _file_size: u64,
-        _file_md5: &str,
-        config: &ScreenConfig,
-    ) -> Result<()> {
-        let mut port = self.open_port()?;
-
-        // Send initial sysinfo to establish connection
-        log::info!("Sending initial sysinfo...");
-        self.send_sysinfo(&mut port)?;
-        thread::sleep(Duration::from_millis(200));
-
-        // Clean up old media files FIRST to avoid playlist fuckery
-        // (the Windows app always sends type:"custom" with the exclude list)
-        log::info!("Cleaning up old media files (keeping: {})", file_name);
-        send_command(
-            &mut port,
-            "mediaDelete",
-            &serde_json::json!({
-                "type": "custom",
-                "exclude": [file_name]
-            }),
-        )?;
-        thread::sleep(Duration::from_millis(300));
-
-        // Keepalive
-        self.send_sysinfo(&mut port)?;
-        thread::sleep(Duration::from_millis(200));
-
-        self.send_screen_config_on(&mut port, &[file_name.to_string()], config)?;
-        self.keepalive(&mut port, 5)?;
-
-        log::info!("Screen configuration sent successfully!");
-        Ok(())
-    }
-
     /// Configure the display for already-present media (no upload, no cleanup).
     pub fn send_screen_config(&self, media: &[String], config: &ScreenConfig) -> Result<()> {
         let mut port = self.open_port()?;

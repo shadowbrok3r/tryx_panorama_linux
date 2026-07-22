@@ -20,8 +20,9 @@ cargo build --release
 | `listen [--hex] [--keepalive]` | Decode and print incoming frames |
 | `send <cmdType> --json '{...}' [--method POST\|STATE]` | Send a raw command, print replies |
 | `sysinfo [--interval-ms 1000] [--count N] [--dry-run]` | Stream system stats to the display (one-shot / bounded) |
-| `daemon [--conn] [--interval-ms 1000] [--quiet] [--status-every N]` | Run forever: 1 Hz sysinfo with auto-reconnect + graceful stop (for systemd) |
-| `image <file> [config flags]` | Full upload flow: `transport` → ADB push → `transported` → `mediaDelete` → `waterBlockScreenId` |
+| `daemon [--conn] [--interval-ms 1000] [--quiet] [--status-every N] [--no-gallery]` | Run forever: 1 Hz sysinfo with auto-reconnect + graceful stop; re-applies the gallery on each connect (for systemd) |
+| `image <file> [--replace] [config flags]` | Upload + **add to the persistent gallery** (accumulates by default; `--replace` wipes everything else). Flow: `transport` → ADB push → `transported` → `waterBlockScreenId` |
+| `gallery list\|add <file>\|rm <name>\|clear\|apply\|mode <Single\|Loop\|Shuffle>` | Manage the accumulating playlist — see [Persistent gallery](#persistent-gallery) |
 | `screen <media>... [config flags]` | Reconfigure the screen for media already on the device |
 | `pump --enable --value 65` | Turbo pump control |
 | `fan smart --curve "30:30,50:40,…"` / `fan fixed <duty>` | LCD/pump fan curve (temp→duty) or fixed duty |
@@ -244,6 +245,30 @@ Only the two commands need the bridge host; the file to display lives on the des
 - **One serial client at a time** — the port is exclusive, so a remote session and the local `daemon` can't both hold it. Stop the daemon while driving the cooler remotely (the smart fan curve only reacts while *some* client streams sysinfo).
 - **No authentication** on either channel — anyone who can reach the ports gets full control of the cooler and adb to the Android board. Run it only on a trusted LAN, set `BIND_ADDR` to a specific interface, or firewall ports 9600/5037.
 - Manual equivalent, without the script: `tryx_panorama_linux --port /dev/tryx0 bridge --listen 0.0.0.0:9600` for serial, plus `adb kill-server && adb -a nodaemon server` for adb.
+
+### Persistent gallery
+
+Uploaded images **accumulate** into a playlist instead of replacing each other, and the playlist **survives reboots** — because the device forgets its displayed playlist on power-off (only the image *files* persist on `/sdcard/pcMedia`; the layout is re-applied from an in-memory config on reconnect). So the host owns the playlist: it's stored in a gallery file and the `daemon` re-applies it on every (re)connect.
+
+```bash
+tryx_panorama_linux image cat.png          # upload + append to the playlist (Loop when >1)
+tryx_panorama_linux image dog.gif           # both now cycle; nothing was deleted
+tryx_panorama_linux gallery list            # show the playlist + what's on the device
+tryx_panorama_linux gallery mode Shuffle    # Single | Loop | Shuffle
+tryx_panorama_linux gallery rm 2026-…-.png  # delete one file + drop it from the playlist
+tryx_panorama_linux gallery clear           # delete all our uploads (keeps foreign files), empty the playlist
+tryx_panorama_linux gallery apply           # re-push the saved playlist now
+tryx_panorama_linux image pic.png --replace # old behavior: wipe every other file, show only this
+```
+
+- **Gallery file**: `$XDG_CONFIG_HOME/tryx-panorama/gallery.json` by default; override with `--gallery-file <path>` or `$TRYX_GALLERY`. The CLI, GUI, and daemon must share the same path (the systemd unit sets `/var/lib/tryx-panorama/gallery.json` so a root daemon and your user tools agree — see the unit comments for the permission note).
+- **Auto-restore**: run the `daemon` (or `systemctl start tryx-panorama`) and the gallery reappears after a reboot / the device's 60 s watchdog. `daemon --no-gallery` opts out.
+- **Foreign files** (anything not named like our `YYYY-MM-DD_HH-MM-SS-mmm.ext` uploads — e.g. a factory-shipped image) are never added to the auto playlist and never deleted by `gallery clear`.
+- **File deletion** uses the device's `mediaDelete {"type":"custom","include":[…]}` form (delete only the listed files), as opposed to the `exclude` form (`--replace`) that keeps only the just-uploaded one.
+
+### Desktop GUI
+
+`cargo build --features gui` builds a tabbed desktop app (**Gallery / Display / Fan & Pump / System**) that wires the full command set. Set the **Device** field to `/dev/ttyACM0` locally, or `tcp://host:9600` to drive a cooler attached to another machine via the [bridge](#remote-control-over-the-lan) above. It reads/writes the same gallery file as the CLI.
 
 `waterBlockScreenId` body:
 
