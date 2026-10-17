@@ -8,8 +8,8 @@
 // it owns the serial port and keeps the display alive between actions. Without
 // it the GUI opens the port itself, and the panel blanks ~60 s after the last
 // command — the header says which. Works over the LAN by setting the Device to
-// `tcp://host:9600` (see `bridge`). Styled with the bundled Mastertech theme
-// (see `theme`).
+// `tcp://host:9600` (see `bridge`). "Now showing" mirrors the panel through adb
+// screencaps. Styled with the bundled Mastertech theme (see `theme`).
 // ============================================================================
 
 use std::path::PathBuf;
@@ -20,15 +20,21 @@ use crate::app_state::{self, AioCoolerApp, AppMessage, FanMode, Route, StatusKin
 use crate::commands;
 use crate::theme::{self, colors, fonts::TextScale, icons::p, metrics::Density, tokens::Tokens};
 
+/// Tallest the "Now showing" preview is drawn, in points.
+const PREVIEW_MAX_H: f32 = 200.0;
+
 impl eframe::App for AioCoolerApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.process_messages();
+        self.process_messages(ctx);
         self.refresh_route();
+        let next_capture = self.schedule_preview(ctx);
         if self.is_processing {
             ctx.request_repaint();
         } else {
-            // Keeps the route badge current (a daemon started/stopped meanwhile).
-            ctx.request_repaint_after(std::time::Duration::from_secs(3));
+            // Keeps the route badge current (a daemon started/stopped meanwhile)
+            // and wakes up for the next preview capture.
+            let badge = std::time::Duration::from_secs(3);
+            ctx.request_repaint_after(next_capture.map_or(badge, |t| t.min(badge)));
         }
     }
 
@@ -94,6 +100,8 @@ impl eframe::App for AioCoolerApp {
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            self.preview_section(ui);
+            ui.add_space(4.0);
             egui::ScrollArea::vertical().show(ui, |ui| match self.current_tab {
                 Tab::Gallery => self.gallery_tab(ui),
                 Tab::Display => self.display_tab(ui),
@@ -146,6 +154,65 @@ impl AioCoolerApp {
         };
         ui.label(RichText::new(format!("{icon} {text}")).color(color))
             .on_hover_text(tip);
+    }
+
+    /// What the panel shows right now: its framebuffer over adb, refreshed on a
+    /// timer and shortly after every action. Above the tabs, so it stays in view.
+    fn preview_section(&mut self, ui: &mut egui::Ui) {
+        let t = Tokens::get(ui.ctx());
+        let body = egui::CollapsingHeader::new(format!("{} Now showing", p::MONITOR))
+            .id_salt("now_showing")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let capturing = self.preview.is_capturing();
+                    if ui
+                        .add_enabled(
+                            !capturing,
+                            egui::Button::new(format!("{} Refresh", p::ARROW_CLOCKWISE)),
+                        )
+                        .clicked()
+                    {
+                        self.capture_preview(ui.ctx());
+                    }
+                    ui.checkbox(
+                        &mut self.preview.auto,
+                        format!("every {} s", app_state::PREVIEW_EVERY.as_secs()),
+                    );
+                    if capturing {
+                        ui.spinner();
+                    }
+                    if let Some(at) = self.preview.captured_at {
+                        let [w, h] = self.preview.native;
+                        ui.label(
+                            RichText::new(format!("{w}×{h} · captured {}", at.format("%H:%M:%S")))
+                                .color(t.text_dim),
+                        );
+                    }
+                });
+                if let Some(e) = &self.preview.error {
+                    ui.label(RichText::new(format!("{} {e}", p::WARNING)).color(t.warn))
+                        .on_hover_text(
+                            "The preview reads the panel over adb (screencap), the same \
+                             channel image uploads use.",
+                        );
+                }
+                match &self.preview.texture {
+                    Some(texture) => {
+                        let size = texture.size_vec2();
+                        let scale = (ui.available_width() / size.x).min(PREVIEW_MAX_H / size.y).min(1.0);
+                        ui.add(
+                            egui::Image::from_texture((texture.id(), size * scale))
+                                .corner_radius(t.radius_md),
+                        );
+                    }
+                    None if self.preview.error.is_none() => {
+                        ui.label(RichText::new("Capturing the panel…").color(t.text_dim));
+                    }
+                    None => {}
+                }
+            });
+        self.preview.visible = body.body_returned.is_some();
     }
 
     // ---- Gallery -----------------------------------------------------------

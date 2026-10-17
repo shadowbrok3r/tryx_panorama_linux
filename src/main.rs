@@ -158,6 +158,12 @@ enum Cmd {
         #[command(flatten)]
         config: ScreenConfigArgs,
     },
+    /// Save what the display is showing right now as a PNG (adb screencap)
+    Screenshot {
+        /// Output file
+        #[arg(default_value = "screen.png")]
+        output: PathBuf,
+    },
     /// Control the turbo pump (POST turboPump)
     Pump {
         /// Enable turbo mode
@@ -477,6 +483,7 @@ fn main() -> anyhow::Result<()> {
                 Cmd::Screen { media, config } => {
                     commands::screen(&cli.port, &media, &ScreenConfig::from(&config))
                 }
+                Cmd::Screenshot { output } => commands::screenshot(&cli.port, &output),
                 Cmd::Pump {
                     enable,
                     value,

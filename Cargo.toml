@@ -13,6 +13,7 @@ gui = [
     "dep:egui_logger",
     "dep:egui_extras",
     "dep:egui-phosphor",
+    "dep:image",
     "dep:rfd",
     "dep:crossbeam",
 ]
@@ -25,6 +26,9 @@ egui_extras = { version = "0.37", features = ["default", "image"], optional = tr
 # crates.io egui-phosphor 0.14 still targets egui 0.36; this fork's egui-037 branch is the
 # one mtech-ui builds against.
 egui-phosphor = { git = "https://github.com/shadowbrok3r/egui-phosphor", rev = "7275d267f6a615004784d57bef7f39d619288739", default-features = false, features = ["regular"], optional = true }
+# Decodes the panel screenshots behind the GUI's "Now showing" preview (same
+# version egui_extras pulls in, which has no PNG decoder enabled by itself).
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 serde = { version = "1", features = ["derive"] }
 crossbeam = { version = "0.8", optional = true }
 serde_json = "1"

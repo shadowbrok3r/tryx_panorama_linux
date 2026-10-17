@@ -973,6 +973,14 @@ pub fn screen(port_path: &str, media: &[String], config: &ScreenConfig) -> Resul
     Ok(())
 }
 
+/// Save what the panel shows right now (adb screencap; no serial traffic).
+pub fn screenshot(port_path: &str, output: &Path) -> Result<()> {
+    let png = crate::screen_setup::capture_screen(port_path)?;
+    std::fs::write(output, &png).with_context(|| format!("Writing {}", output.display()))?;
+    println!("Saved {} ({} bytes)", output.display(), png.len());
+    Ok(())
+}
+
 // ============================================================================
 // gallery — persistent, accumulating image playlist
 // ============================================================================

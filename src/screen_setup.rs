@@ -14,6 +14,8 @@ const ADB_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const ADB_PUSH_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often the serial link is fed while adb runs.
 const KEEPALIVE_EVERY: Duration = Duration::from_secs(2);
+/// Ceiling for one `adb exec-out screencap` (the device PNG-encodes the frame).
+const SCREENCAP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The adb server that sees the cooler, when it isn't the local default:
 /// `ADB_SERVER_SOCKET` if set, else — for a remote device (`tcp://host:port`) —
@@ -52,11 +54,19 @@ fn run_ticking(
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("Failed to run {what} (is adb installed?)"))?;
+    // Drain both pipes while it runs: a screenshot is far bigger than a pipe
+    // buffer, and a child blocked on a full pipe never exits.
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
     let start = Instant::now();
     let mut last_tick = Instant::now();
     loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output().with_context(|| format!("{what} output"));
+        if let Some(status) = child.try_wait()? {
+            return Ok(Output {
+                status,
+                stdout: stdout.join().unwrap_or_default(),
+                stderr: stderr.join().unwrap_or_default(),
+            });
         }
         if start.elapsed() >= timeout {
             let _ = child.kill();
@@ -67,8 +77,41 @@ fn run_ticking(
             tick()?;
             last_tick = Instant::now();
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Read `pipe` to its end on a thread of its own.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
+/// A PNG of what the cooler's panel shows right now, straight from the
+/// Android framebuffer (`adb exec-out screencap -p`).
+pub fn capture_screen(port_path: &str) -> Result<Vec<u8>> {
+    let out = run_ticking(
+        adb_command(port_path).args(["exec-out", "screencap", "-p"]),
+        "adb screencap",
+        SCREENCAP_TIMEOUT,
+        &mut || Ok(()),
+    )?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        anyhow::bail!("adb screencap failed: {}", stderr.trim());
+    }
+    anyhow::ensure!(
+        out.stdout.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "adb screencap returned no image ({} bytes) {}",
+        out.stdout.len(),
+        stderr.trim()
+    );
+    Ok(out.stdout)
 }
 
 use crate::data::{send_command, send_state_command};

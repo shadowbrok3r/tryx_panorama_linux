@@ -2809,6 +2809,7 @@ dependencies = [
  "egui_extras",
  "egui_logger",
  "env_logger",
+ "image",
  "log",
  "md5",
  "rfd",

@@ -24,6 +24,7 @@ cargo build --release
 | `image <file> [--replace] [config flags]` | Upload + **add to the persistent gallery** (accumulates by default; `--replace` wipes everything else). Flow: `transport` → ADB push → `transported` → `waterBlockScreenId` |
 | `gallery list\|add <file>\|rm <name>\|clear\|apply\|mode <Single\|Loop\|Shuffle>` | Manage the accumulating playlist — see [Persistent gallery](#persistent-gallery) |
 | `screen <media>... [config flags]` | Reconfigure the screen for media already on the device |
+| `screenshot [file]` | Save what the display shows right now as a PNG (`adb exec-out screencap`; default `screen.png`) |
 | `pump --enable --value 65` | Turbo pump control |
 | `fan smart --curve "30:30,50:40,…"` / `fan fixed <duty>` | LCD/pump fan curve (temp→duty) or fixed duty |
 | `brightness <0-100>` | Display brightness (device maps to 0-250 internally) |
@@ -277,6 +278,8 @@ tryx_panorama_linux image pic.png --replace # old behavior: wipe every other fil
 ### Desktop GUI
 
 `cargo build --features gui` builds a tabbed desktop app (**Gallery / Display / Fan & Pump / System**, egui 0.37) that wires the full command set. Set the **Device** field to `/dev/ttyACM0` locally, or `tcp://host:9600` to drive a cooler attached to another machine via the [bridge](#remote-control-over-the-lan) above; the field is remembered between sessions (`--port` overrides it). It reads/writes the same gallery file as the CLI.
+
+**Now showing**, above the tabs, mirrors the panel itself: the Android framebuffer captured over adb (`screencap`), every 5 s while auto-refresh is on, and again shortly after every action, so you see an upload or a layout change land — or the panel go black. It uses the same adb route as image uploads (a `tcp://` device reads the bridge host's shared adb server), and collapsing the section stops the captures.
 
 Next to the field, a badge says where commands go: **via daemon** (the daemon owns the port and keeps the display alive), **direct — no daemon** (each command opens the port itself and the panel blanks ~60 s after the last one — start the daemon), or **remote bridge**.
 
