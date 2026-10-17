@@ -231,6 +231,33 @@ fn build_frame(message: &[u8]) -> Vec<u8> {
     frame
 }
 
+/// Frame an already-serialized payload as-is. No CRC steering, so only for
+/// frames our own `FrameDecoder` reads (the daemon relaying replies to its
+/// clients) — never for frames bound for the device.
+pub fn frame_payload(payload: &[u8]) -> Vec<u8> {
+    build_frame(payload)
+}
+
+/// `payload` with its `AckNumber=` header set to `ack`, appended after the
+/// request/status line if the header is missing. The body is untouched.
+pub fn with_ack_number(payload: &[u8], ack: i64) -> Vec<u8> {
+    const SEP: &[u8] = b"\r\n\r\n";
+    let split = payload
+        .windows(SEP.len())
+        .position(|w| w == SEP)
+        .unwrap_or(payload.len());
+    let head = String::from_utf8_lossy(&payload[..split]);
+    let mut lines: Vec<String> = head.split(CRLF).map(str::to_string).collect();
+    let header = format!("AckNumber={ack}");
+    match lines.iter_mut().skip(1).find(|l| l.starts_with("AckNumber=")) {
+        Some(line) => *line = header,
+        None => lines.insert(1.min(lines.len()), header),
+    }
+    let mut out = lines.join(CRLF).into_bytes();
+    out.extend_from_slice(&payload[split..]);
+    out
+}
+
 // ============================================================================
 // Receive side: incremental frame decoder + message parser
 // ============================================================================
@@ -460,7 +487,10 @@ pub fn send_message(
 ) -> anyhow::Result<()> {
     let frame = msg.to_frame()?;
 
-    log::info!(
+    // The sysinfo stream runs every second; keep it out of the info log.
+    let level = if msg.cmd_type == "all" { log::Level::Debug } else { log::Level::Info };
+    log::log!(
+        level,
         "Sending {} {} seq={} ({} bytes)",
         msg.method,
         msg.cmd_type,
@@ -562,6 +592,32 @@ mod tests {
         assert_eq!(lines[3], "ContentType=json");
         assert_eq!(lines[4], "ContentLength=2");
         assert_eq!(lines.len(), 5, "requests carry exactly these 4 headers");
+    }
+
+    #[test]
+    fn ack_number_is_rewritten_in_place_or_added() {
+        let reply = b"1 200\r\nAckNumber=5001\r\nContentLength=2\r\nContentType=json\r\n\r\n{}";
+        let out = with_ack_number(reply, 8);
+        let parsed = parse_message(&out).unwrap();
+        assert_eq!(parsed.ack_number(), Some(8));
+        assert_eq!(parsed.cmd_type, "200");
+        assert_eq!(parsed.body, "{}");
+        assert_eq!(parsed.headers.len(), 3, "no header duplicated or lost");
+
+        let bare = b"1 200\r\nContentLength=0\r\n\r\n";
+        assert_eq!(parse_message(&with_ack_number(bare, 3)).unwrap().ack_number(), Some(3));
+    }
+
+    #[test]
+    fn relayed_frames_round_trip_through_the_decoder() {
+        // A reply whose CRC lands on a marker byte must still decode: our
+        // decoder unescapes before reading the CRC, unlike the device's.
+        for i in 0..300 {
+            let payload = format!("1 200\r\nAckNumber={i}\r\n\r\n{{\"pad\":\"{}\"}}", "y".repeat(i % 37));
+            let mut dec = FrameDecoder::new();
+            dec.push(&frame_payload(payload.as_bytes()));
+            assert_eq!(dec.next_frame().as_deref(), Some(payload.as_bytes()));
+        }
     }
 
     #[test]

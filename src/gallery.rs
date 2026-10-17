@@ -11,13 +11,13 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::Command,
+    process::Stdio,
 };
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::screen_setup::ScreenConfig;
+use crate::screen_setup::{adb_command, ScreenConfig};
 
 /// Where uploaded media lives on the device.
 pub const MEDIA_DIR: &str = "/sdcard/pcMedia";
@@ -109,6 +109,13 @@ impl Gallery {
         }
     }
 
+    /// The `waterBlockScreenId` body that displays this gallery.
+    pub fn layout_json(&self) -> serde_json::Value {
+        let mut cfg = self.config.clone();
+        cfg.play_mode = self.effective_play_mode().to_string();
+        cfg.to_water_block_json(&self.media)
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.media.iter().any(|m| m == name)
     }
@@ -151,18 +158,19 @@ pub fn is_our_upload(name: &str) -> bool {
     })
 }
 
-/// List the media files currently on the device (via `adb shell ls`). Honors
-/// `ADB_SERVER_SOCKET`, so it works over the remote bridge. Returns an empty
-/// list (with a warning) if the directory is missing or adb is unreachable.
-pub fn list_device_media() -> Result<Vec<String>> {
-    let out = Command::new("adb")
+/// List the media files currently on the device (via `adb shell ls`), using
+/// the adb server [`adb_command`] picks for `port_path` (so it works over the
+/// remote bridge). Fails if adb can't reach the device — an empty list always
+/// means the directory really is empty.
+pub fn list_device_media(port_path: &str) -> Result<Vec<String>> {
+    let out = adb_command(port_path)
         .args(["shell", "ls", "-1", MEDIA_DIR])
+        .stdin(Stdio::null())
         .output()
         .context("running `adb shell ls` (is adb installed / a device connected?)")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        log::warn!("adb ls {MEDIA_DIR} failed: {}", stderr.trim());
-        return Ok(Vec::new());
+        anyhow::bail!("adb ls {MEDIA_DIR} failed: {}", stderr.trim());
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut files: Vec<String> = text

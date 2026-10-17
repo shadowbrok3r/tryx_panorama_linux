@@ -20,7 +20,7 @@ cargo build --release
 | `listen [--hex] [--keepalive]` | Decode and print incoming frames |
 | `send <cmdType> --json '{...}' [--method POST\|STATE]` | Send a raw command, print replies |
 | `sysinfo [--interval-ms 1000] [--count N] [--dry-run]` | Stream system stats to the display (one-shot / bounded) |
-| `daemon [--conn] [--interval-ms 1000] [--quiet] [--status-every N] [--no-gallery]` | Run forever: 1 Hz sysinfo with auto-reconnect + graceful stop; re-applies the gallery on each connect (for systemd) |
+| `daemon [--conn] [--interval-ms 1000] [--quiet] [--status-every N] [--no-gallery]` | Run forever and **own the serial port**: 1 Hz sysinfo, relays every other command through its socket, auto-reconnect + graceful stop, restores the display and relayed settings after each reconnect (for systemd) — see [Daemon & systemd](#daemon--systemd) |
 | `image <file> [--replace] [config flags]` | Upload + **add to the persistent gallery** (accumulates by default; `--replace` wipes everything else). Flow: `transport` → ADB push → `transported` → `waterBlockScreenId` |
 | `gallery list\|add <file>\|rm <name>\|clear\|apply\|mode <Single\|Loop\|Shuffle>` | Manage the accumulating playlist — see [Persistent gallery](#persistent-gallery) |
 | `screen <media>... [config flags]` | Reconfigure the screen for media already on the device |
@@ -44,7 +44,7 @@ The device runs two apps: **SerialService** (framing, `conn`/`transport`/`mediaD
 
 > **Fan curve quirks** (from the decompiled interpolation, confirmed on hardware): the device never uses the *last* curve point and writes duty 0 above the second-to-last point. `fan smart` auto-appends a ceiling sentinel so your real top point holds at high temps; pass `--raw` to send the curve verbatim. The curve is applied on every `all` frame using the CPU temperature we stream — so the `daemon` must be running for it to react.
 
-Global flags: `-p/--port <dev>` (default `/dev/ttyACM0`), `-v/-vv` verbosity.
+Global flags: `-p/--port <dev>` (default `/dev/ttyACM0`), `-v/-vv` verbosity, `--socket <path>` (daemon socket), `--direct` (skip a running daemon and open the port yourself).
 
 ## Device Access Setup
 
@@ -202,7 +202,13 @@ Fields we can't read without extra privilege/tools are sent as `0` (honest) rath
 
 ### Daemon & systemd
 
-`daemon` streams sysinfo at 1 Hz forever, with two layers of resilience: it reconnects internally if the serial link drops (verified against a live USB reset — "Send failed (Broken pipe); will reconnect" → reconnected in <1 s), and it exits cleanly on SIGINT/SIGTERM so `systemctl stop` is graceful. `--conn` re-runs the handshake on each connect (handles the device's ~5 s post-reset boot gate via retries); `--status-every N` prints a combined line showing what we sent and what the device reports (fan/pump RPM, free storage).
+`daemon` streams sysinfo at 1 Hz forever, with two layers of resilience: it reconnects internally if the serial link drops (verified against a live USB reset — "Send failed (Broken pipe); will reconnect" → reconnected in <1 s), and it exits cleanly on SIGINT/SIGTERM so `systemctl stop` is graceful. `--conn` logs the device identity on each connect; `--status-every N` prints a combined line showing what we sent and what the device reports (fan/pump RPM, free storage, connected clients).
+
+**The daemon owns the serial port; everything else goes through it.** The tty is exclusive (opened with `TIOCEXCL` + `flock`, so even root can't share it), and the panel blanks unless something keeps streaming `STATE all` (HomeUI's 60 s watchdog). So instead of competing for the port, the daemon listens on a Unix socket and every other tool — CLI, GUI, `bridge` — finds that socket and talks to the device through it. Nothing changes on the command line: `--port /dev/tryx0` just routes through the daemon when one is running (`detect` says which), and falls back to opening the port when none is. `--direct` / `TRYX_DIRECT=1` forces the port.
+
+- **Socket**: `/run/tryx-panorama/tryx.sock` (the unit's `RuntimeDirectory`), else `$XDG_RUNTIME_DIR/tryx-panorama.sock` for a daemon run by hand; `--socket` / `$TRYX_SOCKET` picks another. It gets the serial device's group (`dialout`) and mode `0660` — whoever may open the tty may talk to the daemon.
+- **Relaying**: clients speak the device protocol unchanged. The daemon re-sequences each request and routes each reply back to its sender (with the sender's own `AckNumber`), so concurrent clients never see each other's replies or the daemon's sysinfo replies. Writes are paced ≥120 ms apart (the device drops a read holding more than two frames). The daemon is the only sysinfo source: a client's own `all` frames are answered by the daemon, so a remote desktop never mixes its stats into the display. A request the daemon can't deliver (cooler unplugged) fails right away with `tryx daemon: …` instead of timing out silently. `listen` through the daemon sees every device frame.
+- **Restore**: the daemon records the last value of each state-setting command it relays (`waterBlockScreenId`, `fanLCDSet`, `brightness`, `spec`, `turboPump`, `temperature`, `sysinfoDisplay`, …) in `device-state.json` next to its gallery file, and replays them in order once the device answers after a reconnect (device reboot, USB reset, daemon restart). The display layout comes from that record or from the gallery file, whichever was written last. `--no-gallery` skips the layout.
 
 Install as a service (`packaging/tryx-panorama.service`):
 
@@ -217,12 +223,14 @@ journalctl -u tryx-panorama.service -f
 
 The unit targets `/dev/tryx0` (the stable symlink from the udev rule above) and runs as root so CPU power works. It documents a least-privilege alternative (a `dialout` user, with `cpu.power` then reporting 0) inline.
 
+> **Display went black after a GUI/CLI command?** Without a daemon, a command streams sysinfo only while it runs; ~60 s after the last one, HomeUI's watchdog takes the panel to its disconnected state (black unless `display-in-sleep on`). Keep the daemon running — commands no longer need it stopped. Two other ways to get a black frame are now guarded against: a playlist entry whose file is gone from the device (dropped before the push, with a log line), and `adb wait-for-device` hanging with no device in sight (now fails after 15 s with a hint — typically `ADB_SERVER_SOCKET` when the cooler is on another machine).
+
 ### Remote control over the LAN
 
 The cooler is wired (USB serial + ADB) to one machine, but you can drive it — including the **desktop GUI** — from another machine on the same network. Both device channels are tunneled over TCP:
 
-- **Serial** → the `bridge` subcommand relays a `tcp://host:port` connection to the local serial port, byte-for-byte. Anywhere the tool takes `--port /dev/tryx0`, a remote client passes `--port tcp://host:9600` instead. The GUI's *Serial Device* field takes the same `tcp://` string.
-- **ADB** (image push) → adb's own shared-server mode. A USB device can be claimed by only one adb server, so the bridged machine runs the *only* adb server, listening on all interfaces; the remote sets `ADB_SERVER_SOCKET`.
+- **Serial** → the `bridge` subcommand relays a `tcp://host:port` connection to the cooler, byte-for-byte — through the local daemon when it runs, else straight to the serial port. Anywhere the tool takes `--port /dev/tryx0`, a remote client passes `--port tcp://host:9600` instead. The GUI's *Device* field takes the same `tcp://` string.
+- **ADB** (image push) → adb's own shared-server mode. A USB device can be claimed by only one adb server, so the bridged machine runs the *only* adb server, listening on all interfaces. A `tcp://host:…` device points adb at `tcp:host:5037` automatically; set `ADB_SERVER_SOCKET` only to override that.
 
 One helper starts both:
 
@@ -235,14 +243,13 @@ BIN=/usr/local/bin/tryx_panorama_linux packaging/remote-bridge.sh
 
 ```bash
 # On your desktop:
-export ADB_SERVER_SOCKET=tcp:<host-ip>:5037
-tryx_panorama_linux                                  # GUI: set Serial Device = tcp://<host-ip>:9600
+tryx_panorama_linux                                  # GUI: set Device = tcp://<host-ip>:9600
 tryx_panorama_linux --port tcp://<host-ip>:9600 spec # or any CLI command
 ```
 
 Only the two commands need the bridge host; the file to display lives on the desktop and `adb push` streams it across. Notes:
 
-- **One serial client at a time** — the port is exclusive, so a remote session and the local `daemon` can't both hold it. Stop the daemon while driving the cooler remotely (the smart fan curve only reacts while *some* client streams sysinfo).
+- **Keep the daemon running on the bridge host.** The bridge relays through it, so remote commands and the local daemon coexist, and the daemon keeps the display alive (and the smart fan curve fed) between them. Without a daemon the bridge holds the port for one client at a time, and the panel blanks ~60 s after the last remote command.
 - **No authentication** on either channel — anyone who can reach the ports gets full control of the cooler and adb to the Android board. Run it only on a trusted LAN, set `BIND_ADDR` to a specific interface, or firewall ports 9600/5037.
 - Manual equivalent, without the script: `tryx_panorama_linux --port /dev/tryx0 bridge --listen 0.0.0.0:9600` for serial, plus `adb kill-server && adb -a nodaemon server` for adb.
 
@@ -262,13 +269,18 @@ tryx_panorama_linux image pic.png --replace # old behavior: wipe every other fil
 ```
 
 - **Gallery file**: `$XDG_CONFIG_HOME/tryx-panorama/gallery.json` by default; override with `--gallery-file <path>` or `$TRYX_GALLERY`. The CLI, GUI, and daemon must share the same path (the systemd unit sets `/var/lib/tryx-panorama/gallery.json` so a root daemon and your user tools agree — see the unit comments for the permission note).
-- **Auto-restore**: run the `daemon` (or `systemctl start tryx-panorama`) and the gallery reappears after a reboot / the device's 60 s watchdog. `daemon --no-gallery` opts out.
+- **Auto-restore**: run the `daemon` (or `systemctl start tryx-panorama`) and the display reappears after a reboot / the device's 60 s watchdog — the last layout any client set *through the daemon* (so a GUI on another machine counts), or this gallery file if it was written more recently. `daemon --no-gallery` opts out.
+- **Stale entries**: before pushing a playlist, `image` / `gallery apply` / the GUI drop entries whose files are no longer on the device (each would play as a black frame), and say so in the log.
 - **Foreign files** (anything not named like our `YYYY-MM-DD_HH-MM-SS-mmm.ext` uploads — e.g. a factory-shipped image) are never added to the auto playlist and never deleted by `gallery clear`.
 - **File deletion** uses the device's `mediaDelete {"type":"custom","include":[…]}` form (delete only the listed files), as opposed to the `exclude` form (`--replace`) that keeps only the just-uploaded one.
 
 ### Desktop GUI
 
-`cargo build --features gui` builds a tabbed desktop app (**Gallery / Display / Fan & Pump / System**) that wires the full command set. Set the **Device** field to `/dev/ttyACM0` locally, or `tcp://host:9600` to drive a cooler attached to another machine via the [bridge](#remote-control-over-the-lan) above. It reads/writes the same gallery file as the CLI.
+`cargo build --features gui` builds a tabbed desktop app (**Gallery / Display / Fan & Pump / System**, egui 0.37) that wires the full command set. Set the **Device** field to `/dev/ttyACM0` locally, or `tcp://host:9600` to drive a cooler attached to another machine via the [bridge](#remote-control-over-the-lan) above; the field is remembered between sessions (`--port` overrides it). It reads/writes the same gallery file as the CLI.
+
+Next to the field, a badge says where commands go: **via daemon** (the daemon owns the port and keeps the display alive), **direct — no daemon** (each command opens the port itself and the panel blanks ~60 s after the last one — start the daemon), or **remote bridge**.
+
+It wears the **Mastertech theme**, ported from `mtech-ui`: the egui style from a Mastertech theme export (bundled at `assets/themes/mastertech.json`), Inter UI faces (`assets/fonts`, SIL OFL), Phosphor icons, a density overlay and a text scale. *System → Appearance* switches density and text size, loads another Mastertech export (or a bare egui `Style` JSON), or resets to the bundled theme; choices are saved to `~/.config/tryx-panorama/theme.json`. The export's backdrop-blur (`glass`) material is carried along but not rendered.
 
 `waterBlockScreenId` body:
 
@@ -335,14 +347,22 @@ File naming: `YYYY-MM-DD_HH-MM-SS-mmm.<ext>` from the PC's local clock.
 src/
 ├── main.rs          # clap CLI entry; GUI behind `gui` feature
 ├── commands.rs      # CLI subcommands: detect/conn/listen/send/sysinfo/daemon/image/screen/pump/…
+├── hub.rs           # Daemon serial hub: owns the port, relays clients over a Unix socket, restore
 ├── data.rs          # Protocol: framing, escaping, FrameDecoder (RX), message parse/build
+├── gallery.rs       # Persistent playlist + adb media listing
 ├── screen_setup.rs  # AIO controller: ADB push, screen config, keepalive
 ├── sysinfo.rs       # SysInfoReader: real sensor reading (deltas) for the STATE all payload
 ├── gui.rs           # egui desktop app        (feature = "gui")
-└── app_state.rs     # GUI state/threading     (feature = "gui")
+├── app_state.rs     # GUI state/threading     (feature = "gui")
+└── theme/           # Mastertech theme, ported from mtech-ui (feature = "gui")
+
+assets/
+├── fonts/           # Inter (SIL OFL)
+└── themes/          # bundled Mastertech theme export
 
 packaging/
-└── tryx-panorama.service   # systemd unit for the daemon
+├── tryx-panorama.service   # systemd unit for the daemon
+└── remote-bridge.sh        # serial bridge + shared adb for remote control
 ```
 
 ## Building
@@ -350,8 +370,10 @@ packaging/
 ```bash
 cargo build --release                 # CLI only (headless-friendly)
 cargo build --release --features gui  # CLI + desktop GUI
-cargo test                            # protocol unit tests
+cargo test                            # unit tests (add --features gui for the theme's)
 ```
+
+The GUI pulls `egui-phosphor` from a git fork (crates.io's 0.14 still targets egui 0.36), so the first build needs network access to GitHub.
 
 Note: `.cargo/config.toml` configures clang+mold for CI. On machines without them:
 

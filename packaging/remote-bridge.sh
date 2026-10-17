@@ -9,11 +9,16 @@
 #   2. a shared ADB server    (image push over adb)  -> tcp:THIS_HOST:5037
 #
 # Then on your desktop machine:
-#   export ADB_SERVER_SOCKET=tcp:THIS_HOST:5037
-#   # GUI: set the "Serial Device" field to  tcp://THIS_HOST:9600
+#   # GUI: set the "Device" field to  tcp://THIS_HOST:9600
 #   tryx_panorama_linux            # (built --features gui)
 #   # or CLI, e.g.:
 #   tryx_panorama_linux --port tcp://THIS_HOST:9600 spec
+# A tcp:// device sends adb to tcp:THIS_HOST:5037 by itself; set
+# ADB_SERVER_SOCKET only to point somewhere else.
+#
+# Keep the tryx daemon running here: when it is, the bridge relays through its
+# socket instead of opening the serial port, and the daemon keeps the display
+# alive (and the fan curve fed) between remote commands.
 #
 # SECURITY: neither channel is authenticated. Anyone who can reach these ports
 # gets full control of the cooler + adb to the Android board. Only run this on a
@@ -54,8 +59,9 @@ echo "==========================================================================
 echo " TRYX Panorama remote bridge is up."
 echo
 echo " On your DESKTOP machine:"
-echo "   export ADB_SERVER_SOCKET=tcp:${HOST_IP}:${ADB_PORT}"
-echo "   # GUI: set 'Serial Device' to   tcp://${HOST_IP}:${BRIDGE_PORT}"
+echo "   # GUI: set 'Device' to   tcp://${HOST_IP}:${BRIDGE_PORT}"
+echo "   # (adb follows a tcp:// device to tcp:${HOST_IP}:5037 by itself;"
+echo "   #  export ADB_SERVER_SOCKET=tcp:${HOST_IP}:${ADB_PORT} if you changed ADB_PORT)"
 echo "   tryx_panorama_linux                     # (built --features gui)"
 echo "   # CLI example:"
 echo "   tryx_panorama_linux --port tcp://${HOST_IP}:${BRIDGE_PORT} spec"

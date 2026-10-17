@@ -12,14 +12,19 @@ gui = [
     "dep:egui",
     "dep:egui_logger",
     "dep:egui_extras",
+    "dep:egui-phosphor",
     "dep:rfd",
     "dep:crossbeam",
 ]
 
 [dependencies]
-eframe = { version = "0.35", features = ["persistence", "serde", "default_fonts", "glow", "x11"], default-features = false, optional = true }
-egui_logger = { version="0.11", optional = true }
-egui_extras = { version = "0.35", features = ["default", "image"], optional = true }
+# `clipboard` became opt-in in eframe 0.37; without it copy/paste in text fields is dead.
+eframe = { version = "0.37", features = ["persistence", "serde", "default_fonts", "glow", "x11", "clipboard"], default-features = false, optional = true }
+egui_logger = { version = "0.13", optional = true }
+egui_extras = { version = "0.37", features = ["default", "image"], optional = true }
+# crates.io egui-phosphor 0.14 still targets egui 0.36; this fork's egui-037 branch is the
+# one mtech-ui builds against.
+egui-phosphor = { git = "https://github.com/shadowbrok3r/egui-phosphor", rev = "7275d267f6a615004784d57bef7f39d619288739", default-features = false, features = ["regular"], optional = true }
 serde = { version = "1", features = ["derive"] }
 crossbeam = { version = "0.8", optional = true }
 serde_json = "1"
@@ -37,9 +42,9 @@ chrono = "0.4"
 ctrlc = { version = "3", features = ["termination"] }
 
 [dependencies.egui]
-version = "0.35"
+version = "0.37"
 default-features = false
-features = ["rayon", "bytemuck"]
+features = ["rayon", "bytemuck", "serde"]
 optional = true
 
 [profile.release]

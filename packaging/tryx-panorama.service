@@ -1,5 +1,5 @@
 [Unit]
-Description=Tryx Panorama AIO display — sysinfo daemon
+Description=Tryx Panorama AIO display — sysinfo daemon and serial hub
 Documentation=https://github.com/shadowbrok3r/tryx_panorama_linux
 # Wait for the device's serial node. /dev/tryx0 is created by the udev rule in
 # the README; systemd derives this .device unit from that symlink's real device.
@@ -8,16 +8,21 @@ Wants=dev-tryx0.device
 
 [Service]
 Type=simple
-# Stream system stats to the display at 1 Hz. --conn logs device identity on
-# each (re)connect; the daemon reconnects internally if the link drops, and
-# Restart=always covers the process dying outright.
-# --gallery-file points at a shared location (systemd creates /var/lib/tryx-panorama
-# via StateDirectory) so the root daemon re-applies the SAME gallery the user's
-# CLI/GUI edits. Those tools must target the same path: either pass
-# `--gallery-file /var/lib/tryx-panorama/gallery.json` or
-# `export TRYX_GALLERY=/var/lib/tryx-panorama/gallery.json`. If the non-root GUI
-# needs to write it, loosen the dir perms (e.g. chgrp dialout + chmod g+w) or run
-# this unit as the dialout user (see below) so a home-dir gallery is shared.
+# The daemon owns the serial port for good: it streams system stats to the
+# display at 1 Hz and relays every other tool through its socket,
+# /run/tryx-panorama/tryx.sock (RuntimeDirectory below). The GUI, the CLI and
+# `bridge` find that socket on their own, so there is no need to stop this unit
+# to use them. The socket takes the serial device's group (dialout) with mode
+# 0660: whoever may open the tty may talk to the daemon instead.
+#
+# --conn logs device identity on each (re)connect; the daemon reconnects
+# internally if the link drops, and Restart=always covers the process dying
+# outright. After every reconnect it restores the display and the settings
+# clients set through it (fan curve, brightness, …), saved in
+# /var/lib/tryx-panorama/device-state.json. The layout comes from that file or
+# from --gallery-file, whichever was written last — so CLI edits made against
+# that gallery file while the daemon was down still win (pass the same
+# --gallery-file or export TRYX_GALLERY=/var/lib/tryx-panorama/gallery.json).
 ExecStart=/usr/local/bin/tryx_panorama_linux --port /dev/tryx0 \
     --gallery-file /var/lib/tryx-panorama/gallery.json \
     daemon --conn --quiet
@@ -25,6 +30,8 @@ Restart=always
 RestartSec=2
 Environment=RUST_LOG=info
 StateDirectory=tryx-panorama
+RuntimeDirectory=tryx-panorama
+RuntimeDirectoryMode=0755
 
 # Running as root unlocks CPU package power via RAPL (energy_uj is root-only)
 # and needs no group setup. For least privilege instead, comment out nothing

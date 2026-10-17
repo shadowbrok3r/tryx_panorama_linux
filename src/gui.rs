@@ -3,22 +3,37 @@
 //
 // Four tabs surface the full control set. Every action button clones the state
 // it needs and calls a `commands::*` fn on a background thread via
-// `spawn_action` (each command opens/closes its own port; `is_processing`
-// serializes them because the serial port is exclusive). Works locally or over
-// the LAN by setting the Serial Device to `tcp://host:9600` (see `bridge`).
+// `spawn_action` (each command opens/closes its own link; `is_processing`
+// serializes them). While the daemon runs, those links go through its socket:
+// it owns the serial port and keeps the display alive between actions. Without
+// it the GUI opens the port itself, and the panel blanks ~60 s after the last
+// command — the header says which. Works over the LAN by setting the Device to
+// `tcp://host:9600` (see `bridge`). Styled with the bundled Mastertech theme
+// (see `theme`).
 // ============================================================================
 
-use eframe::egui;
+use std::path::PathBuf;
 
-use crate::app_state::{self, AioCoolerApp, AppMessage, FanMode, Tab};
+use eframe::egui::{self, RichText};
+
+use crate::app_state::{self, AioCoolerApp, AppMessage, FanMode, Route, StatusKind, Tab};
 use crate::commands;
+use crate::theme::{self, colors, fonts::TextScale, icons::p, metrics::Density, tokens::Tokens};
 
 impl eframe::App for AioCoolerApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_messages();
+        self.refresh_route();
         if self.is_processing {
             ctx.request_repaint();
+        } else {
+            // Keeps the route badge current (a daemon started/stopped meanwhile).
+            ctx.request_repaint_after(std::time::Duration::from_secs(3));
         }
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(app_state::DEVICE_KEY, self.serial_device.clone());
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -27,15 +42,19 @@ impl eframe::App for AioCoolerApp {
             ui.heading("Tryx Panorama Controller");
             ui.horizontal(|ui| {
                 ui.label("Device:");
-                ui.text_edit_singleline(&mut self.serial_device);
-                ui.label("(tcp://host:9600 for a remote bridge)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.serial_device)
+                        .hint_text("/dev/ttyACM0 or tcp://host:9600")
+                        .desired_width(240.0),
+                );
+                self.route_badge(ui);
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.current_tab, Tab::Gallery, "🖼 Gallery");
-                ui.selectable_value(&mut self.current_tab, Tab::Display, "🎨 Display");
-                ui.selectable_value(&mut self.current_tab, Tab::FanPump, "🌀 Fan & Pump");
-                ui.selectable_value(&mut self.current_tab, Tab::System, "⚙ System");
+                ui.selectable_value(&mut self.current_tab, Tab::Gallery, format!("{} Gallery", p::IMAGE));
+                ui.selectable_value(&mut self.current_tab, Tab::Display, format!("{} Display", p::PALETTE));
+                ui.selectable_value(&mut self.current_tab, Tab::FanPump, format!("{} Fan & Pump", p::FAN));
+                ui.selectable_value(&mut self.current_tab, Tab::System, format!("{} System", p::GEAR));
             });
             ui.add_space(4.0);
         });
@@ -43,7 +62,14 @@ impl eframe::App for AioCoolerApp {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(&self.status_message);
+                let t = Tokens::get(ui.ctx());
+                let (icon, color) = match self.status_kind {
+                    StatusKind::Idle => (p::INFO, t.text_dim),
+                    StatusKind::Busy => (p::HOURGLASS_SIMPLE, t.text),
+                    StatusKind::Ok => (p::CHECK_CIRCLE, t.success),
+                    StatusKind::Error => (p::WARNING_CIRCLE, t.error),
+                };
+                ui.label(RichText::new(format!("{icon} {}", self.status_message)).color(color));
                 if self.is_processing {
                     ui.spinner();
                 }
@@ -58,9 +84,13 @@ impl eframe::App for AioCoolerApp {
             .resizable(true)
             .default_size(280.0)
             .show(ui, |ui| {
-                ui.heading("📋 Logs");
+                ui.heading(format!("{} Logs", p::SCROLL));
                 ui.separator();
-                egui_logger::logger_ui().show(ui);
+                let t = Tokens::get(ui.ctx());
+                egui_logger::logger_ui()
+                    .warn_color(t.warn)
+                    .error_color(t.error)
+                    .show(ui);
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -75,29 +105,74 @@ impl eframe::App for AioCoolerApp {
 }
 
 impl AioCoolerApp {
+    /// Where commands for the Device field go, and what that means for the display.
+    fn route_badge(&self, ui: &mut egui::Ui) {
+        let t = Tokens::get(ui.ctx());
+        let (icon, color, text, tip) = match &self.route {
+            Route::Daemon(sock) => (
+                p::PLUGS_CONNECTED,
+                t.success,
+                "via daemon",
+                format!(
+                    "The tryx daemon at {} owns the serial port. Commands go through it, \
+                     and it keeps the display alive between them.",
+                    sock.display()
+                ),
+            ),
+            Route::Direct => (
+                p::WARNING,
+                t.warn,
+                "direct — no daemon",
+                "No daemon is running, so each command opens the port itself and nothing \
+                 streams sysinfo afterwards: the display blanks about 60 s after the last \
+                 command. Start the daemon (systemctl start tryx-panorama) to keep it alive."
+                    .to_string(),
+            ),
+            Route::Remote => (
+                p::GLOBE,
+                t.info,
+                "remote bridge",
+                "Commands go to a bridge on another machine — through its daemon, if one \
+                 runs there. Images go over that host's shared adb server \
+                 (ADB_SERVER_SOCKET defaults to tcp:<host>:5037)."
+                    .to_string(),
+            ),
+            Route::Socket => (
+                p::PLUGS_CONNECTED,
+                t.info,
+                "daemon socket",
+                "Commands go to the daemon socket named in the Device field.".to_string(),
+            ),
+        };
+        ui.label(RichText::new(format!("{icon} {text}")).color(color))
+            .on_hover_text(tip);
+    }
+
     // ---- Gallery -----------------------------------------------------------
     fn gallery_tab(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.heading("Add image");
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Browse…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
+                if ui.button(format!("{} Browse…", p::FOLDER_OPEN)).clicked()
+                    && let Some(path) = rfd::FileDialog::new()
                         .add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp"])
                         .pick_file()
-                    {
-                        self.selected_image = Some(path);
-                    }
+                {
+                    self.selected_image = Some(path);
                 }
                 match &self.selected_image {
                     Some(p) => ui.label(format!("{}", p.display())),
-                    None => ui.label("No image selected"),
+                    None => ui.label(RichText::new("No image selected").color(colors::weak_text(ui))),
                 };
             });
             ui.checkbox(&mut self.replace_on_upload, "Replace (wipe every other file)");
             let can_upload = !self.is_processing && self.selected_image.is_some();
             if ui
-                .add_enabled(can_upload, egui::Button::new("🚀 Upload & add to gallery"))
+                .add_enabled(
+                    can_upload,
+                    egui::Button::new(format!("{} Upload & add to gallery", p::UPLOAD_SIMPLE)),
+                )
                 .clicked()
             {
                 let dev = self.serial_device.clone();
@@ -130,7 +205,10 @@ impl AioCoolerApp {
             });
 
             if self.gallery.media.is_empty() {
-                ui.label("(playlist empty — upload an image above)");
+                ui.label(
+                    RichText::new("(playlist empty — upload an image above)")
+                        .color(colors::weak_text(ui)),
+                );
             }
 
             let mut move_up: Option<usize> = None;
@@ -140,22 +218,26 @@ impl AioCoolerApp {
             for (i, name) in self.gallery.media.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.label(format!("{}.", i + 1));
-                    if ui.add_enabled(i > 0, egui::Button::new("↑")).clicked() {
+                    if ui.add_enabled(i > 0, egui::Button::new(p::ARROW_UP)).clicked() {
                         move_up = Some(i);
                     }
-                    if ui.add_enabled(i + 1 < len, egui::Button::new("↓")).clicked() {
+                    if ui.add_enabled(i + 1 < len, egui::Button::new(p::ARROW_DOWN)).clicked() {
                         move_down = Some(i);
                     }
-                    if ui.button("🗑").clicked() {
+                    if ui.button(p::TRASH).on_hover_text("Delete from the device").clicked() {
                         remove = Some(name.clone());
                     }
                     let on_device = self.device_media.is_empty()
                         || self.device_media.iter().any(|d| d == name);
-                    ui.label(if on_device {
-                        name.clone()
+                    if on_device {
+                        ui.label(name);
                     } else {
-                        format!("{name}  [missing on device]")
-                    });
+                        ui.label(
+                            RichText::new(format!("{name}  [missing on device]"))
+                                .color(colors::warn(ui)),
+                        )
+                        .on_hover_text("Shows as a black frame; Apply drops it from the playlist");
+                    }
                 });
             }
             if let Some(i) = move_up {
@@ -179,19 +261,28 @@ impl AioCoolerApp {
 
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!self.is_processing, egui::Button::new("✔ Apply to device"))
+                .add_enabled(
+                    !self.is_processing,
+                    egui::Button::new(format!("{} Apply to device", p::CHECK)),
+                )
                 .clicked()
             {
                 self.apply_gallery();
             }
             if ui
-                .add_enabled(!self.is_processing, egui::Button::new("⟳ Refresh device list"))
+                .add_enabled(
+                    !self.is_processing,
+                    egui::Button::new(format!("{} Refresh device list", p::ARROW_CLOCKWISE)),
+                )
                 .clicked()
             {
                 self.refresh_device_media();
             }
             if ui
-                .add_enabled(!self.is_processing, egui::Button::new("🧹 Clear gallery"))
+                .add_enabled(
+                    !self.is_processing,
+                    egui::Button::new(format!("{} Clear gallery", p::BROOM)),
+                )
                 .clicked()
             {
                 let dev = self.serial_device.clone();
@@ -298,7 +389,10 @@ impl AioCoolerApp {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!self.is_processing, egui::Button::new("✔ Apply display"))
+                .add_enabled(
+                    !self.is_processing,
+                    egui::Button::new(format!("{} Apply display", p::CHECK)),
+                )
                 .clicked()
             {
                 self.apply_gallery();
@@ -334,7 +428,7 @@ impl AioCoolerApp {
                         ui.horizontal(|ui| {
                             ui.add(egui::DragValue::new(&mut self.fan_curve[i].0).prefix("T "));
                             ui.add(egui::DragValue::new(&mut self.fan_curve[i].1).suffix("%"));
-                            if ui.button("🗑").clicked() {
+                            if ui.button(p::TRASH).clicked() {
                                 remove = Some(i);
                             }
                         });
@@ -343,13 +437,16 @@ impl AioCoolerApp {
                         self.fan_curve.remove(i);
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("+ Add point").clicked() {
+                        if ui.button(format!("{} Add point", p::PLUS)).clicked() {
                             self.fan_curve.push((60, 50));
                         }
                         ui.checkbox(&mut self.fan_raw, "raw (no ceiling sentinel)");
                     });
                     if ui
-                        .add_enabled(!self.is_processing, egui::Button::new("✔ Apply curve"))
+                        .add_enabled(
+                            !self.is_processing,
+                            egui::Button::new(format!("{} Apply curve", p::CHECK)),
+                        )
                         .clicked()
                     {
                         let dev = self.serial_device.clone();
@@ -363,7 +460,10 @@ impl AioCoolerApp {
                 FanMode::Fixed => {
                     ui.add(egui::Slider::new(&mut self.fan_fixed_duty, 0..=100).text("duty %"));
                     if ui
-                        .add_enabled(!self.is_processing, egui::Button::new("✔ Apply fixed duty"))
+                        .add_enabled(
+                            !self.is_processing,
+                            egui::Button::new(format!("{} Apply fixed duty", p::CHECK)),
+                        )
                         .clicked()
                     {
                         let dev = self.serial_device.clone();
@@ -384,7 +484,10 @@ impl AioCoolerApp {
             ui.checkbox(&mut self.pump_enable, "Enable turbo");
             ui.add(egui::Slider::new(&mut self.pump_value, 0..=255).text("PWM"));
             if ui
-                .add_enabled(!self.is_processing, egui::Button::new("✔ Apply pump"))
+                .add_enabled(
+                    !self.is_processing,
+                    egui::Button::new(format!("{} Apply pump", p::CHECK)),
+                )
                 .clicked()
             {
                 let dev = self.serial_device.clone();
@@ -411,7 +514,10 @@ impl AioCoolerApp {
             });
             ui.horizontal(|ui| {
                 ui.label("Panel power:");
-                if ui.add_enabled(!self.is_processing, egui::Button::new("On")).clicked() {
+                if ui
+                    .add_enabled(!self.is_processing, egui::Button::new(format!("{} On", p::POWER)))
+                    .clicked()
+                {
                     let dev = self.serial_device.clone();
                     self.spawn_action("Panel on…", move |_tx| commands::screen_power(&dev, true, 2));
                 }
@@ -475,7 +581,12 @@ impl AioCoolerApp {
                     self.cpu_name = commands::detect_cpu_name();
                     self.gpu_name = commands::detect_gpu_name();
                 }
-                if ui.add_enabled(!self.is_processing, egui::Button::new("✔ Apply names")).clicked()
+                if ui
+                    .add_enabled(
+                        !self.is_processing,
+                        egui::Button::new(format!("{} Apply names", p::CHECK)),
+                    )
+                    .clicked()
                 {
                     let dev = self.serial_device.clone();
                     let (cpu, gpu) = (self.cpu_name.clone(), self.gpu_name.clone());
@@ -515,6 +626,75 @@ impl AioCoolerApp {
                 }
             });
         });
+
+        ui.add_space(8.0);
+        self.appearance_group(ui);
+    }
+
+    /// Density, text size and theme file — the same knobs as Mastertech's.
+    fn appearance_group(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.heading(format!("{} Appearance", p::PAINT_BRUSH));
+            ui.separator();
+            let mut theme = self.theme.clone();
+            let mut changed = false;
+            egui::Grid::new("appearance_grid").num_columns(2).spacing([20.0, 8.0]).show(ui, |ui| {
+                ui.label("Density:");
+                egui::ComboBox::from_id_salt("density")
+                    .selected_text(theme.density.label())
+                    .show_ui(ui, |ui| {
+                        for d in Density::ALL {
+                            changed |= ui.selectable_value(&mut theme.density, d, d.label()).changed();
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Text size:");
+                egui::ComboBox::from_id_salt("text_scale")
+                    .selected_text(theme.text_scale.label())
+                    .show_ui(ui, |ui| {
+                        for s in TextScale::ALL {
+                            changed |= ui.selectable_value(&mut theme.text_scale, s, s.label()).changed();
+                        }
+                    });
+                ui.end_row();
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .button(format!("{} Load theme…", p::FOLDER_OPEN))
+                    .on_hover_text("A Mastertech theme export (JSON), or a bare egui Style")
+                    .clicked()
+                    && let Some(path) =
+                        rfd::FileDialog::new().add_filter("Theme", &["json"]).pick_file()
+                {
+                    match std::fs::read(&path)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|bytes| theme::theme_from_json(&bytes))
+                    {
+                        Ok(loaded) => {
+                            theme = loaded;
+                            changed = true;
+                        }
+                        Err(e) => log::error!("Can't load theme {}: {e:#}", path.display()),
+                    }
+                }
+                if ui
+                    .button(format!("{} Mastertech default", p::ARROW_COUNTER_CLOCKWISE))
+                    .clicked()
+                {
+                    self.reset_theme(ui.ctx());
+                    changed = false;
+                }
+            });
+            if changed {
+                self.set_theme(ui.ctx(), theme);
+            }
+            ui.label(
+                RichText::new(format!("Custom theme file: {}", theme::user_theme_path().display()))
+                    .small()
+                    .color(colors::weak_text(ui)),
+            );
+        });
     }
 
     /// Persist + push the current in-memory gallery (media + play_mode + config).
@@ -530,8 +710,9 @@ impl AioCoolerApp {
     }
 }
 
-/// Launch the desktop GUI.
-pub fn run() -> anyhow::Result<()> {
+/// Launch the desktop GUI. `port` (an explicit `--port`) wins over the device
+/// remembered from the last session.
+pub fn run(port: Option<String>, gallery_path: PathBuf) -> anyhow::Result<()> {
     egui_logger::builder().max_level(log::LevelFilter::Info).init().unwrap();
 
     let options = eframe::NativeOptions {
@@ -544,9 +725,14 @@ pub fn run() -> anyhow::Result<()> {
     eframe::run_native(
         "Tryx Panorama Controller",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(app_state::AioCoolerApp::default()))
+            let saved = theme::load();
+            theme::install(&cc.egui_ctx, &saved);
+            let device = port
+                .or_else(|| cc.storage.and_then(|s| s.get_string(app_state::DEVICE_KEY)))
+                .unwrap_or_else(|| "/dev/ttyACM0".to_string());
+            Ok(Box::new(AioCoolerApp::new(device, gallery_path, saved)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {e}"))

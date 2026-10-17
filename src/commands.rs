@@ -5,6 +5,7 @@
 use std::{
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -19,16 +20,25 @@ use anyhow::{Context, Result};
 
 use crate::data::{self, FrameDecoder, ParsedMessage};
 use crate::gallery::{self, Gallery};
+use crate::hub;
 use crate::screen_setup::{AioCoolerController, ScreenConfig};
 use crate::sysinfo::{SysInfo, SysInfoReader};
 
 const TRYX_VID: u16 = 0x18d1;
 const TRYX_PID: u16 = 0x2d03;
 
-/// Open the device transport. A `tcp://host:port` path connects to a remote
-/// `bridge` (see [`bridge`]) instead of a local serial device, so the desktop
-/// GUI/CLI can drive a cooler attached to another machine on the LAN. Everything
-/// downstream keeps operating on a `Box<dyn serialport::SerialPort>`.
+/// Read timeout every transport starts with; the framing loops poll on it.
+const PORT_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Open the device transport. Everything downstream operates on a
+/// `Box<dyn serialport::SerialPort>`, whichever of these it is:
+///
+/// - `tcp://host:port` — a remote [`bridge`], to drive a cooler wired to
+///   another machine on the LAN.
+/// - `unix:///path` — a daemon socket, explicitly.
+/// - a device path — routed through the local daemon when one is running
+///   (it owns the port; see [`hub`]), else the serial device itself.
+///   `--direct` / `TRYX_DIRECT=1` skips the daemon.
 pub fn open_port(path: &str) -> Result<Box<dyn serialport::SerialPort>> {
     if let Some(addr) = path.strip_prefix("tcp://") {
         let stream = TcpStream::connect(addr).with_context(|| {
@@ -39,49 +49,113 @@ pub fn open_port(path: &str) -> Result<Box<dyn serialport::SerialPort>> {
             )
         })?;
         stream.set_nodelay(true).ok();
-        let timeout = Duration::from_millis(100);
-        stream.set_read_timeout(Some(timeout)).ok();
-        return Ok(Box::new(TcpSerial {
-            stream,
-            addr: addr.to_string(),
-            timeout,
-        }));
+        return Ok(Box::new(NetSerial::new(NetStream::Tcp(stream), path.to_string())?));
     }
+    if let Some(sock) = path.strip_prefix("unix://") {
+        let stream = UnixStream::connect(sock)
+            .with_context(|| format!("Failed to connect to the tryx daemon at {sock}"))?;
+        return Ok(Box::new(NetSerial::new(NetStream::Unix(stream), path.to_string())?));
+    }
+    if let Some((stream, sock)) = hub::connect() {
+        hub::note_routed(&sock);
+        let name = format!("unix://{}", sock.display());
+        return Ok(Box::new(NetSerial::new(NetStream::Unix(stream), name)?));
+    }
+    open_device(path)
+}
+
+/// Open the serial device itself, bypassing any daemon. Only the daemon should
+/// call this; everything else goes through [`open_port`].
+pub fn open_device(path: &str) -> Result<Box<dyn serialport::SerialPort>> {
     let port = serialport::new(path, 115200)
-        .timeout(Duration::from_millis(100))
+        .timeout(PORT_TIMEOUT)
         .open()
         .with_context(|| {
             format!(
                 "Failed to open serial port {path}\n\
                  If this is a permission error: sudo usermod -aG dialout $USER (then re-login),\n\
-                 or install the udev rule from the README. Run `detect` for diagnostics."
+                 or install the udev rule from the README. If it is busy, another process\n\
+                 holds it (only the daemon should). Run `detect` for diagnostics."
             )
         })?;
     Ok(port)
 }
 
-/// A `TcpStream` masquerading as a `serialport::SerialPort` so the network
-/// transport is a drop-in for the local one. The one behavior that matters to
+/// The socket a [`NetSerial`] runs over.
+pub(crate) enum NetStream {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl NetStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            NetStream::Tcp(s) => s.set_read_timeout(timeout),
+            NetStream::Unix(s) => s.set_read_timeout(timeout),
+        }
+    }
+
+    fn try_clone(&self) -> io::Result<NetStream> {
+        Ok(match self {
+            NetStream::Tcp(s) => NetStream::Tcp(s.try_clone()?),
+            NetStream::Unix(s) => NetStream::Unix(s.try_clone()?),
+        })
+    }
+}
+
+impl io::Read for NetStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            NetStream::Tcp(s) => s.read(buf),
+            NetStream::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl io::Write for NetStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            NetStream::Tcp(s) => s.write(buf),
+            NetStream::Unix(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            NetStream::Tcp(s) => s.flush(),
+            NetStream::Unix(s) => s.flush(),
+        }
+    }
+}
+
+/// A socket masquerading as a `serialport::SerialPort`, so the bridge and the
+/// daemon are drop-ins for the local tty. The one behavior that matters to
 /// callers: a read timeout on a socket surfaces as `WouldBlock`, but the framing
 /// loops expect a serial-style `TimedOut` — so we remap it in `read`.
-struct TcpSerial {
-    stream: TcpStream,
-    addr: String,
+pub(crate) struct NetSerial {
+    stream: NetStream,
+    name: String,
     timeout: Duration,
 }
 
-impl io::Read for TcpSerial {
+impl NetSerial {
+    pub(crate) fn new(stream: NetStream, name: String) -> Result<Self> {
+        stream.set_read_timeout(Some(PORT_TIMEOUT))?;
+        Ok(Self { stream, name, timeout: PORT_TIMEOUT })
+    }
+}
+
+impl io::Read for NetSerial {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self.stream.read(buf) {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                Err(io::Error::new(io::ErrorKind::TimedOut, "tcp read timeout"))
+                Err(io::Error::new(io::ErrorKind::TimedOut, "socket read timeout"))
             }
             other => other,
         }
     }
 }
 
-impl io::Write for TcpSerial {
+impl io::Write for NetSerial {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.stream.write(buf)
     }
@@ -90,9 +164,9 @@ impl io::Write for TcpSerial {
     }
 }
 
-impl serialport::SerialPort for TcpSerial {
+impl serialport::SerialPort for NetSerial {
     fn name(&self) -> Option<String> {
-        Some(format!("tcp://{}", self.addr))
+        Some(self.name.clone())
     }
     fn baud_rate(&self) -> serialport::Result<u32> {
         Ok(115200)
@@ -167,9 +241,9 @@ impl serialport::SerialPort for TcpSerial {
         let stream = self.stream.try_clone().map_err(|e| {
             serialport::Error::new(serialport::ErrorKind::Io(e.kind()), e.to_string())
         })?;
-        Ok(Box::new(TcpSerial {
+        Ok(Box::new(NetSerial {
             stream,
-            addr: self.addr.clone(),
+            name: self.name.clone(),
             timeout: self.timeout,
         }))
     }
@@ -281,6 +355,8 @@ fn bridge_session(port_path: &str, stream: TcpStream) -> Result<()> {
 }
 
 /// Read whatever is available on the port, decode frames, return parsed messages.
+/// Fails on a daemon reply saying it could not deliver a request (the device
+/// itself only ever answers `200`).
 pub fn pump_incoming(
     port: &mut Box<dyn serialport::SerialPort>,
     dec: &mut FrameDecoder,
@@ -298,7 +374,12 @@ pub fn pump_incoming(
                 dec.push(&chunk[..n]);
                 while let Some(frame) = dec.next_frame() {
                     match data::parse_message(&frame) {
-                        Ok(msg) => out.push(msg),
+                        Ok(msg) => {
+                            if let Some(e) = hub_error(&msg) {
+                                return Err(e);
+                            }
+                            out.push(msg)
+                        }
                         Err(e) => log::warn!("Unparseable frame ({} bytes): {e}", frame.len()),
                     }
                 }
@@ -309,6 +390,26 @@ pub fn pump_incoming(
         }
     }
     Ok(out)
+}
+
+/// The error in a non-200 reply the daemon wrote itself, if `msg` is one.
+fn hub_error(msg: &ParsedMessage) -> Option<anyhow::Error> {
+    let from_hub = msg.headers.get("Source").is_some_and(|s| s == hub::SOURCE);
+    if !(msg.is_reply() && from_hub && msg.cmd_type != "200") {
+        return None;
+    }
+    let why = msg
+        .json()
+        .and_then(|j| j.get("error")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| msg.body.trim().to_string());
+    Some(anyhow::anyhow!("tryx daemon: {why}"))
+}
+
+/// Whether `port` reaches the device through a socket (daemon or bridge)
+/// rather than a local tty.
+fn is_relayed(port: &dyn serialport::SerialPort) -> bool {
+    port.name()
+        .is_some_and(|n| n.starts_with("unix://") || n.starts_with("tcp://"))
 }
 
 pub fn print_message(msg: &ParsedMessage) {
@@ -348,7 +449,17 @@ pub fn print_message(msg: &ParsedMessage) {
 // ============================================================================
 
 pub fn detect() -> Result<()> {
-    println!("── Serial ports ─────────────────────────────────────────────");
+    println!("── Daemon ──────────────────────────────────────────────────");
+    let daemon = hub::running_daemon();
+    match &daemon {
+        Some(sock) => println!(
+            "  running at {} — it holds the serial port; commands route through it",
+            sock.display()
+        ),
+        None => println!("  not running — commands open the serial port directly"),
+    }
+
+    println!("\n── Serial ports ─────────────────────────────────────────────");
     let mut candidates: Vec<String> = Vec::new();
     match serialport::available_ports() {
         Ok(ports) if !ports.is_empty() => {
@@ -403,6 +514,9 @@ pub fn detect() -> Result<()> {
             .open()
         {
             Ok(_) => println!("  {path}: OK (openable)"),
+            Err(e) if daemon.is_some() => {
+                println!("  {path}: busy — expected, the daemon holds it ({e})");
+            }
             Err(e) => {
                 println!("  {path}: FAILED — {e}");
                 if e.to_string().to_lowercase().contains("permission") {
@@ -441,6 +555,11 @@ pub fn listen(port_path: &str, hex: bool, timeout_secs: Option<u64>, keepalive: 
     let mut port = open_port(port_path)?;
     let mut dec = FrameDecoder::new();
     println!("Listening on {port_path} (Ctrl-C to stop)…");
+    if is_relayed(port.as_ref()) {
+        // A daemon routes us only our own replies; ask for a copy of everything.
+        // A bare device (behind a plain bridge) just acks the unknown cmdType.
+        data::send_command(&mut port, hub::MONITOR_CMD, &serde_json::json!({}))?;
+    }
     if keepalive {
         // 1 Hz like the Windows app: holds the device's 10s RX watchdog open
         // AND feeds cpu.temperature to its smart fan curve
@@ -570,6 +689,9 @@ pub fn send(
 
 pub fn sysinfo_stream(port_path: &str, interval_ms: u64, count: u64, dry_run: bool) -> Result<()> {
     let mut port = if dry_run { None } else { Some(open_port(port_path)?) };
+    if port.as_ref().and_then(|p| p.name()).is_some_and(|n| n.starts_with("unix://")) {
+        println!("Note: the daemon is the display's sysinfo source; it answers these frames itself.");
+    }
     let mut dec = FrameDecoder::new();
     let mut reader = SysInfoReader::new();
     reader.log_detected();
@@ -614,38 +736,8 @@ pub fn sysinfo_stream(port_path: &str, interval_ms: u64, count: u64, dry_run: bo
 }
 
 // ============================================================================
-// daemon — long-running sysinfo streamer with auto-reconnect + graceful stop
+// daemon — owns the port: sysinfo stream, client hub, auto-reconnect + restore
 // ============================================================================
-
-/// Latest device-reported status, parsed from the 200 reply bodies.
-#[derive(Default)]
-struct DeviceStatus {
-    fan_lcd: String,
-    turbo_pump: String,
-    available_storage: u64,
-    warning: String,
-}
-
-impl DeviceStatus {
-    fn update(&mut self, msg: &ParsedMessage) {
-        if let Some(json) = msg.json() {
-            if let Some(s) = json.get("status") {
-                if let Some(v) = s.get("fanLCD").and_then(|v| v.as_str()) {
-                    self.fan_lcd = v.to_string();
-                }
-                if let Some(v) = s.get("turboPump").and_then(|v| v.as_str()) {
-                    self.turbo_pump = v.to_string();
-                }
-            }
-            if let Some(v) = json.get("availableStorage").and_then(|v| v.as_u64()) {
-                self.available_storage = v;
-            }
-            if let Some(v) = json.get("warning").and_then(|v| v.as_str()) {
-                self.warning = v.to_string();
-            }
-        }
-    }
-}
 
 fn install_signal_handler() -> Arc<AtomicBool> {
     let running = Arc::new(AtomicBool::new(true));
@@ -658,18 +750,9 @@ fn install_signal_handler() -> Arc<AtomicBool> {
     running
 }
 
-/// Sleep until `deadline`, waking early (and returning false) if shutdown fires.
-fn sleep_until(deadline: Instant, running: &AtomicBool) -> bool {
-    while running.load(Ordering::SeqCst) {
-        let now = Instant::now();
-        if now >= deadline {
-            return true;
-        }
-        thread::sleep((deadline - now).min(Duration::from_millis(100)));
-    }
-    false
-}
-
+/// Hold the serial port for good: stream sysinfo, relay every other tool's
+/// traffic (see [`hub`]), reconnect when the link drops, and restore the
+/// display + relayed settings on each reconnect. Stops on SIGINT/SIGTERM.
 pub fn daemon(
     port_path: &str,
     interval_ms: u64,
@@ -682,136 +765,33 @@ pub fn daemon(
     let running = install_signal_handler();
     let mut reader = SysInfoReader::new();
     reader.log_detected();
+    let (listener, socket) = hub::bind(Path::new(port_path))?;
+    let state_path = gallery_path.with_file_name("device-state.json");
     log::info!(
-        "Daemon starting: {port_path} @ {interval_ms}ms interval (Ctrl-C / SIGTERM to stop)"
+        "Daemon starting: {port_path} @ {interval_ms}ms interval; clients connect via {} \
+         (Ctrl-C / SIGTERM to stop)",
+        socket.path().display()
     );
+    log::info!("Relayed settings persist in {}", state_path.display());
 
-    let reconnect_delay = Duration::from_millis(interval_ms.clamp(500, 3000));
-
-    // Outer loop: (re)establish the connection whenever it drops
-    while running.load(Ordering::SeqCst) {
-        let mut port = match open_port(port_path) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("Open failed: {e:#}. Retrying in {:?}…", reconnect_delay);
-                if !sleep_until(Instant::now() + reconnect_delay, &running) {
-                    break;
-                }
-                continue;
-            }
-        };
-        let mut dec = FrameDecoder::new();
-        log::info!("Connected on {port_path}");
-
-        if do_conn {
-            if let Err(e) = data::send_command(&mut port, "conn", &serde_json::json!({})) {
-                log::warn!("conn send failed: {e:#}");
-            } else if let Ok(msgs) = pump_for(&mut port, &mut dec, Duration::from_millis(1500)) {
-                for m in &msgs {
-                    if m.is_reply() && !m.body.trim().is_empty() {
-                        log::info!("Device: {}", m.body.trim());
-                    }
-                }
-            }
-        }
-
-        // Re-apply the persistent gallery on every (re)connect so the display
-        // survives reboots and the device's 60s watchdog. Reloaded each time so
-        // CLI/GUI edits are picked up on the next reconnect.
-        if !no_gallery {
-            match Gallery::load(gallery_path) {
-                Ok(g) if !g.media.is_empty() => match send_gallery_on(&mut port, &mut dec, &g) {
-                    Ok(()) => log::info!(
-                        "Applied gallery: {} image(s) [{}]",
-                        g.media.len(),
-                        g.effective_play_mode()
-                    ),
-                    Err(e) => log::warn!("gallery apply failed: {e:#}"),
-                },
-                Ok(_) => {} // empty gallery: nothing to restore
-                Err(e) => log::warn!("gallery load failed ({}): {e:#}", gallery_path.display()),
-            }
-        }
-
-        let mut status = DeviceStatus::default();
-        let mut ticks = 0u64;
-
-        // Inner loop: stream sysinfo until shutdown or a serial error
-        'stream: while running.load(Ordering::SeqCst) {
-            let info = reader.sample();
-            let json = match serde_json::to_value(&info) {
-                Ok(j) => j,
-                Err(e) => {
-                    log::error!("sysinfo serialize failed: {e}");
-                    break 'stream;
-                }
-            };
-
-            if let Err(e) = data::send_state_command(&mut port, "all", &json) {
-                log::warn!("Send failed ({e}); assuming disconnect, will reconnect");
-                break 'stream;
-            }
-
-            match pump_incoming(&mut port, &mut dec, false) {
-                Ok(msgs) => {
-                    for m in &msgs {
-                        status.update(m);
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Read failed ({e}); assuming disconnect, will reconnect");
-                    break 'stream;
-                }
-            }
-
-            ticks += 1;
-            if !quiet && status_every > 0 && ticks % status_every == 0 {
-                println!(
-                    "[{}] sent CPU {}°C {}% {}W / GPU {}°C {}% {}W  │  device fanLCD={} pump={} free={:.2}GB",
-                    chrono::Local::now().format("%H:%M:%S"),
-                    info.cpu.temperature,
-                    info.cpu.load,
-                    info.cpu.power,
-                    info.gpu.temperature,
-                    info.gpu.load,
-                    info.gpu.power,
-                    if status.fan_lcd.is_empty() { "?" } else { &status.fan_lcd },
-                    if status.turbo_pump.is_empty() { "?" } else { &status.turbo_pump },
-                    status.available_storage as f64 / 1e9,
-                );
-            }
-
-            if !sleep_until(Instant::now() + Duration::from_millis(interval_ms), &running) {
-                break 'stream;
-            }
-        }
-
-        // Left the stream loop: either shutting down, or reconnecting
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-        drop(port);
-        if !sleep_until(Instant::now() + reconnect_delay, &running) {
-            break;
-        }
-    }
-
-    log::info!("Daemon stopped.");
-    Ok(())
-}
-
-/// Pump incoming for a fixed duration, collecting all parsed messages.
-fn pump_for(
-    port: &mut Box<dyn serialport::SerialPort>,
-    dec: &mut FrameDecoder,
-    dur: Duration,
-) -> Result<Vec<ParsedMessage>> {
-    let deadline = Instant::now() + dur;
-    let mut out = Vec::new();
-    while Instant::now() < deadline {
-        out.extend(pump_incoming(port, dec, false)?);
-    }
-    Ok(out)
+    let opts = hub::Options {
+        interval: Duration::from_millis(interval_ms),
+        reconnect_delay: Duration::from_millis(interval_ms.clamp(500, 3000)),
+        conn: do_conn,
+        quiet,
+        status_every,
+        gallery_path: gallery_path.to_path_buf(),
+        restore_display: !no_gallery,
+        state_path: Some(state_path),
+    };
+    let sock = socket.path().to_path_buf();
+    let open = || {
+        let port = open_device(port_path)?;
+        // The device node (and its group) only exists while plugged in.
+        hub::share_with_device_group(&sock, Path::new(port_path));
+        Ok(port)
+    };
+    hub::run(opts, listener, open, || reader.sample(), running)
 }
 
 // ============================================================================
@@ -856,7 +836,8 @@ fn upload_file(
     );
 
     // Establish traffic (device resets its port after 10s of RX silence)
-    data::send_state_command(port, "all", &serde_json::to_value(SysInfo::get_sysinfo())?)?;
+    let mut reader = SysInfoReader::new();
+    data::send_state_command(port, "all", &serde_json::to_value(reader.sample())?)?;
     drain_replies(port, dec, Duration::from_millis(300))?;
 
     // 1. Announce the transfer (device opens/truncates the target file)
@@ -868,8 +849,13 @@ fn upload_file(
     drain_replies(port, dec, Duration::from_millis(500))?;
 
     // 2. Actual bytes go over ADB (the Windows app does the same — its serial
-    //    md5 is literally the string "todo"; we send the real one, also unchecked)
-    controller.adb_push(&path_buf, &remote_name)?;
+    //    md5 is literally the string "todo"; we send the real one, also unchecked).
+    //    A slow push must not starve the link: with no daemon streaming, the
+    //    device resets its port after 10 s of silence and blanks after 60 s.
+    controller.adb_push(&path_buf, &remote_name, &mut || {
+        data::send_state_command(port, "all", &serde_json::to_value(reader.sample())?)?;
+        drain_replies(port, dec, Duration::from_millis(100))
+    })?;
 
     // 3. Commit
     data::send_command(
@@ -883,17 +869,40 @@ fn upload_file(
 }
 
 /// Send the gallery's playlist + display settings on an already-open port.
-/// Used by upload/apply here and by the daemon (which owns its own port).
 fn send_gallery_on(
     port: &mut Box<dyn serialport::SerialPort>,
     dec: &mut FrameDecoder,
     gallery: &Gallery,
 ) -> Result<()> {
-    let mut cfg = gallery.config.clone();
-    cfg.play_mode = gallery.effective_play_mode().to_string();
-    data::send_command(port, "waterBlockScreenId", &cfg.to_water_block_json(&gallery.media))?;
+    data::send_command(port, "waterBlockScreenId", &gallery.layout_json())?;
     drain_replies(port, dec, Duration::from_millis(400))?;
     Ok(())
+}
+
+/// Drop playlist entries the device no longer has — in Loop/Shuffle each one
+/// plays as a black frame. Returns whether anything was dropped; leaves the
+/// playlist alone when adb can't list the device.
+fn prune_missing(gallery: &mut Gallery, port_path: &str) -> bool {
+    let present = match gallery::list_device_media(port_path) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("Could not check the playlist against the device ({e:#}); sending it as-is");
+            return false;
+        }
+    };
+    let missing: Vec<String> =
+        gallery.media.iter().filter(|m| !present.contains(m)).cloned().collect();
+    if missing.is_empty() {
+        return false;
+    }
+    log::warn!(
+        "Dropping {} playlist entr{} missing on the device: {}",
+        missing.len(),
+        if missing.len() == 1 { "y" } else { "ies" },
+        missing.join(", ")
+    );
+    gallery.media.retain(|m| present.contains(m));
+    true
 }
 
 /// A few sysinfo ticks so temps populate and the link stays up after a config push.
@@ -941,6 +950,7 @@ pub fn image(
         gallery.media = vec![remote_name.clone()];
     } else {
         gallery.add(remote_name.clone());
+        prune_missing(&mut gallery, port_path);
     }
     gallery.config = config.clone();
     gallery.save(gallery_path)?;
@@ -969,7 +979,10 @@ pub fn screen(port_path: &str, media: &[String], config: &ScreenConfig) -> Resul
 
 /// Re-send the saved gallery playlist to the device now (manual restore).
 pub fn apply_gallery(port_path: &str, gallery_path: &Path) -> Result<()> {
-    let gallery = Gallery::load(gallery_path)?;
+    let mut gallery = Gallery::load(gallery_path)?;
+    if prune_missing(&mut gallery, port_path) {
+        gallery.save(gallery_path)?;
+    }
     let mut port = open_port(port_path)?;
     let mut dec = FrameDecoder::new();
     // Prime the link before the config push.
@@ -990,12 +1003,14 @@ pub fn apply_gallery(port_path: &str, gallery_path: &Path) -> Result<()> {
 /// source of truth, rather than reading from disk first.
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn gallery_write_apply(port_path: &str, gallery: &Gallery, gallery_path: &Path) -> Result<()> {
+    let mut gallery = gallery.clone();
+    prune_missing(&mut gallery, port_path);
     gallery.save(gallery_path)?;
     let mut port = open_port(port_path)?;
     let mut dec = FrameDecoder::new();
     data::send_state_command(&mut port, "all", &serde_json::to_value(SysInfo::get_sysinfo())?)?;
     drain_replies(&mut port, &mut dec, Duration::from_millis(300))?;
-    send_gallery_on(&mut port, &mut dec, gallery)?;
+    send_gallery_on(&mut port, &mut dec, &gallery)?;
     keepalive_ticks(&mut port, &mut dec, 3)?;
     Ok(())
 }
@@ -1007,9 +1022,11 @@ pub fn gallery_add(port_path: &str, path: &PathBuf, gallery_path: &Path) -> Resu
 }
 
 /// List device media, annotated with playlist position / foreign status.
-pub fn gallery_list(gallery_path: &Path) -> Result<()> {
+pub fn gallery_list(port_path: &str, gallery_path: &Path) -> Result<()> {
     let gallery = Gallery::load(gallery_path)?;
-    let device = gallery::list_device_media()?;
+    let device = gallery::list_device_media(port_path)
+        .map_err(|e| println!("(can't list device media: {e:#})"))
+        .ok();
 
     println!(
         "Gallery ({} in playlist, play mode: {}):",
@@ -1020,9 +1037,10 @@ pub fn gallery_list(gallery_path: &Path) -> Result<()> {
         println!("  (empty)");
     }
     for (i, name) in gallery.media.iter().enumerate() {
-        let on_device = if device.iter().any(|d| d == name) { "" } else { "  [MISSING on device]" };
-        println!("  {}. {name}{on_device}", i + 1);
+        let missing = device.as_ref().is_some_and(|d| !d.contains(name));
+        println!("  {}. {name}{}", i + 1, if missing { "  [MISSING on device]" } else { "" });
     }
+    let device = device.unwrap_or_default();
 
     let extras: Vec<&String> = device.iter().filter(|d| !gallery.contains(d)).collect();
     if !extras.is_empty() {
@@ -1039,6 +1057,7 @@ pub fn gallery_list(gallery_path: &Path) -> Result<()> {
 pub fn gallery_rm(port_path: &str, name: &str, gallery_path: &Path) -> Result<()> {
     let mut gallery = Gallery::load(gallery_path)?;
     let was_in_playlist = gallery.remove(name);
+    prune_missing(&mut gallery, port_path);
 
     let mut port = open_port(port_path)?;
     let mut dec = FrameDecoder::new();
@@ -1066,7 +1085,7 @@ pub fn gallery_rm(port_path: &str, name: &str, gallery_path: &Path) -> Result<()
 
 /// Delete all of *our* uploads (keeps foreign files) and empty the playlist.
 pub fn gallery_clear(port_path: &str, gallery_path: &Path) -> Result<()> {
-    let ours: Vec<String> = gallery::list_device_media()?
+    let ours: Vec<String> = gallery::list_device_media(port_path)?
         .into_iter()
         .filter(|f| gallery::is_our_upload(f))
         .collect();

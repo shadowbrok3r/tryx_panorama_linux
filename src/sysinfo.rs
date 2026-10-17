@@ -873,6 +873,28 @@ impl SysInfo {
         std::thread::sleep(std::time::Duration::from_millis(250));
         reader.sample()
     }
+
+    /// A fixed, fully populated sample for tests.
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Self {
+        SysInfo {
+            network: NetworkInfo { upload: 1, download: 2 },
+            memory: MemoryInfo { total: 1, used: 1, load: 1, temperature: 1, speed: 1 },
+            cpu: CpuInfo {
+                load: 1, temperature: 1, speedAverage: 1, power: 1, voltage: 1.0, usage: 1,
+            },
+            gpu: GpuInfo {
+                load: 1, temperature: 1, fan: 1, speed: 1, power: 1, voltage: 1.0,
+            },
+            disk: DiskInfo {
+                total: 1, used: 1, load: 1, activity: 1, temperature: 1,
+                read_speed: 1, write_speed: 1,
+            },
+            fans: vec![FanInfo { on_board: true, name: "CPU1".into(), value: 1200, max: 3000 }],
+            motherboard: MotherboardInfo { temperature: 1, pch_temperature: 1 },
+            timestamp: 1,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -904,24 +926,7 @@ mod tests {
     /// silently blank a field on the display. Lock the wire schema.
     #[test]
     fn wire_schema_keys() {
-        let info = SysInfo {
-            network: NetworkInfo { upload: 1, download: 2 },
-            memory: MemoryInfo { total: 1, used: 1, load: 1, temperature: 1, speed: 1 },
-            cpu: CpuInfo {
-                load: 1, temperature: 1, speedAverage: 1, power: 1, voltage: 1.0, usage: 1,
-            },
-            gpu: GpuInfo {
-                load: 1, temperature: 1, fan: 1, speed: 1, power: 1, voltage: 1.0,
-            },
-            disk: DiskInfo {
-                total: 1, used: 1, load: 1, activity: 1, temperature: 1,
-                read_speed: 1, write_speed: 1,
-            },
-            fans: vec![FanInfo { on_board: true, name: "CPU1".into(), value: 1200, max: 3000 }],
-            motherboard: MotherboardInfo { temperature: 1, pch_temperature: 1 },
-            timestamp: 1,
-        };
-        let json = serde_json::to_string(&info).unwrap();
+        let json = serde_json::to_string(&SysInfo::fixture()).unwrap();
         for key in [
             "\"network\"", "\"memory\"", "\"cpu\"", "\"gpu\"", "\"disk\"", "\"fans\"",
             "\"motherboard\"", "\"timestamp\"",

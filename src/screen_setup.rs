@@ -1,7 +1,75 @@
-use std::{path::PathBuf, process::Command, thread, time::Duration};
+use std::{
+    path::PathBuf,
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 use serde::{Deserialize, Serialize};
 use anyhow::{Context, Result};
 use std::io::Read;
+
+/// How long `adb wait-for-device` may take before we call the device absent.
+const ADB_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Ceiling for one `adb push` (large GIFs over a LAN are slow, not stuck).
+const ADB_PUSH_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often the serial link is fed while adb runs.
+const KEEPALIVE_EVERY: Duration = Duration::from_secs(2);
+
+/// The adb server that sees the cooler, when it isn't the local default:
+/// `ADB_SERVER_SOCKET` if set, else — for a remote device (`tcp://host:port`) —
+/// that host's server on the default port, as `packaging/remote-bridge.sh` shares it.
+fn adb_server(port_path: &str) -> Option<String> {
+    if let Ok(server) = std::env::var("ADB_SERVER_SOCKET")
+        && !server.is_empty()
+    {
+        return Some(server);
+    }
+    let addr = port_path.strip_prefix("tcp://")?;
+    let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+    Some(format!("tcp:{host}:5037"))
+}
+
+/// `adb`, aimed at the server [`adb_server`] picks for `port_path`.
+pub fn adb_command(port_path: &str) -> Command {
+    let mut cmd = Command::new("adb");
+    if let Some(server) = adb_server(port_path) {
+        cmd.env("ADB_SERVER_SOCKET", server);
+    }
+    cmd
+}
+
+/// Run `cmd` to completion, calling `tick` every [`KEEPALIVE_EVERY`] while it
+/// runs. Kills it and fails after `timeout`.
+fn run_ticking(
+    cmd: &mut Command,
+    what: &str,
+    timeout: Duration,
+    tick: &mut dyn FnMut() -> Result<()>,
+) -> Result<Output> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to run {what} (is adb installed?)"))?;
+    let start = Instant::now();
+    let mut last_tick = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().with_context(|| format!("{what} output"));
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("{what} did not finish within {}s", timeout.as_secs());
+        }
+        if last_tick.elapsed() >= KEEPALIVE_EVERY {
+            tick()?;
+            last_tick = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
 
 use crate::data::{send_command, send_state_command};
 use crate::sysinfo::SysInfo;
@@ -75,25 +143,48 @@ impl AioCoolerController {
         }
     }
 
-    pub fn adb_push(&self, local_path: &PathBuf, remote_name: &str) -> Result<()> {
+    /// Push `local_path` to the device's media dir as `remote_name`, calling
+    /// `tick` every couple of seconds meanwhile so the serial link stays fed.
+    pub fn adb_push(
+        &self,
+        local_path: &PathBuf,
+        remote_name: &str,
+        tick: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
         log::info!("Pushing image to device through ADB");
-        
-        let status = Command::new("adb")
-            .args(["wait-for-device"])
-            .status()
-            .context("Failed to execute adb wait-for-device")?;
 
-        if !status.success() {
-            anyhow::bail!("ADB wait-for-device failed");
+        let wait = run_ticking(
+            adb_command(&self.serial_device).arg("wait-for-device"),
+            "adb wait-for-device",
+            ADB_WAIT_TIMEOUT,
+            tick,
+        )
+        .with_context(|| {
+            format!(
+                "No ADB device appeared — the image bytes travel over ADB, not serial. \
+                 Check `adb devices`. If the cooler is attached to another machine, \
+                 run packaging/remote-bridge.sh there and export \
+                 ADB_SERVER_SOCKET=tcp:<that-host>:5037 (a tcp:// device sets this \
+                 for you). Using: {}",
+                adb_server(&self.serial_device).unwrap_or_else(|| "the local adb server".into())
+            )
+        })?;
+        if !wait.status.success() {
+            anyhow::bail!(
+                "adb wait-for-device failed: {}",
+                String::from_utf8_lossy(&wait.stderr).trim()
+            );
         }
 
         let remote_path = format!("/sdcard/pcMedia/{}", remote_name);
         log::info!("Pushing {} to {}", local_path.display(), remote_path);
 
-        let output = Command::new("adb")
-            .args(["push", &local_path.to_string_lossy(), &remote_path])
-            .output()
-            .context("Failed to execute adb push")?;
+        let output = run_ticking(
+            adb_command(&self.serial_device).args(["push", &local_path.to_string_lossy(), &remote_path]),
+            "adb push",
+            ADB_PUSH_TIMEOUT,
+            tick,
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -105,10 +196,13 @@ impl AioCoolerController {
 
         // Verify file exists and has correct size
         let expected_size = std::fs::metadata(local_path)?.len();
-        let size_check = Command::new("adb")
-            .args(["shell", "stat", "-c", "%s", &remote_path])
-            .output()?;
-        
+        let size_check = run_ticking(
+            adb_command(&self.serial_device).args(["shell", "stat", "-c", "%s", &remote_path]),
+            "adb shell stat",
+            ADB_WAIT_TIMEOUT,
+            tick,
+        )?;
+
         if size_check.status.success() {
             let remote_size: u64 = String::from_utf8_lossy(&size_check.stdout)
                 .trim()

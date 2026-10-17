@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, parser::ValueSource};
 
 #[cfg(feature = "gui")]
 mod app_state;
@@ -9,8 +9,11 @@ mod data;
 mod gallery;
 #[cfg(feature = "gui")]
 mod gui;
+mod hub;
 mod screen_setup;
 mod sysinfo;
+#[cfg(feature = "gui")]
+mod theme;
 
 use screen_setup::ScreenConfig;
 
@@ -35,6 +38,17 @@ struct Cli {
     /// or $TRYX_GALLERY). CLI, GUI, and daemon must share the same path.
     #[arg(long, global = true)]
     gallery_file: Option<String>,
+
+    /// Daemon socket: where `daemon` listens and other commands look for it
+    /// (default: $TRYX_SOCKET, else /run/tryx-panorama/tryx.sock, then
+    /// $XDG_RUNTIME_DIR/tryx-panorama.sock)
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
+
+    /// Open the serial port directly even if a daemon is running (it will be
+    /// busy unless the daemon is stopped). Also: TRYX_DIRECT=1
+    #[arg(long, global = true)]
+    direct: bool,
 
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -88,7 +102,9 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Run continuously: stream sysinfo at 1Hz with auto-reconnect (for systemd)
+    /// Run continuously and own the serial port (for systemd): stream sysinfo at
+    /// 1Hz, relay every other command through a socket, auto-reconnect, and
+    /// restore the display + relayed settings after the device reconnects
     Daemon {
         /// Milliseconds between updates
         #[arg(long, default_value_t = 1000)]
@@ -102,7 +118,8 @@ enum Cmd {
         /// Print a status line every N ticks (0 = never)
         #[arg(long, default_value_t = 10)]
         status_every: u64,
-        /// Don't re-apply the saved gallery on (re)connect
+        /// Don't restore the display layout (saved gallery or last relayed
+        /// layout) on (re)connect
         #[arg(long)]
         no_gallery: bool,
     },
@@ -353,7 +370,15 @@ fn init_cli_logging(verbose: u8) {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    // The GUI remembers its last device; only a `--port` typed now overrides it.
+    let port_given = matches.value_source("port") == Some(ValueSource::CommandLine);
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    if let Some(sock) = &cli.socket {
+        hub::set_socket_override(sock.clone());
+    }
+    hub::set_direct(cli.direct);
+    let gallery_path = gallery::Gallery::resolve_path(cli.gallery_file.as_deref());
 
     let command = match cli.command {
         Some(cmd) => cmd,
@@ -365,7 +390,6 @@ fn main() -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "gui"))]
             {
-                use clap::CommandFactory;
                 Cli::command().print_help()?;
                 return Ok(());
             }
@@ -377,10 +401,11 @@ fn main() -> anyhow::Result<()> {
             #[cfg(feature = "gui")]
             {
                 // The GUI installs its own logger (egui_logger)
-                gui::run()
+                gui::run(port_given.then(|| cli.port.clone()), gallery_path)
             }
             #[cfg(not(feature = "gui"))]
             {
+                let _ = port_given;
                 anyhow::bail!(
                     "This binary was built without the GUI. Rebuild with: cargo build --features gui"
                 )
@@ -388,7 +413,6 @@ fn main() -> anyhow::Result<()> {
         }
         cmd => {
             init_cli_logging(cli.verbose);
-            let gallery_path = gallery::Gallery::resolve_path(cli.gallery_file.as_deref());
             match cmd {
                 Cmd::Detect => commands::detect(),
                 Cmd::Conn { retries } => commands::conn(&cli.port, retries),
@@ -437,7 +461,7 @@ fn main() -> anyhow::Result<()> {
                     replace,
                 ),
                 Cmd::Gallery { action } => match action {
-                    GalleryAction::List => commands::gallery_list(&gallery_path),
+                    GalleryAction::List => commands::gallery_list(&cli.port, &gallery_path),
                     GalleryAction::Add { path } => {
                         commands::gallery_add(&cli.port, &path, &gallery_path)
                     }
