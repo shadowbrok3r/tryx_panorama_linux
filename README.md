@@ -10,7 +10,7 @@ The default build is a headless CLI — no GUI dependencies:
 
 ```bash
 cargo build --release
-./target/x86_64-unknown-linux-gnu/release/tryx_panorama_linux detect   # find device, diagnose permissions
+./target/release/tryx_panorama_linux detect   # find device, diagnose permissions
 ```
 
 | Command | Purpose |
@@ -214,13 +214,15 @@ Fields we can't read without extra privilege/tools are sent as `0` (honest) rath
 Install as a service (`packaging/tryx-panorama.service`):
 
 ```bash
-sudo install -m755 target/x86_64-unknown-linux-gnu/release/tryx_panorama_linux /usr/local/bin/
+sudo install -m755 target/release/tryx_panorama_linux /usr/local/bin/
 sudo install -m644 packaging/tryx-panorama.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now tryx-panorama.service
 systemctl status tryx-panorama.service
 journalctl -u tryx-panorama.service -f
 ```
+
+> Builds land in `target/release/`. Older checkouts built into `target/x86_64-unknown-linux-gnu/release/`; a binary left there is stale — if the service log says `unexpected argument '--gallery-file'`, that old binary is what got installed.
 
 The unit targets `/dev/tryx0` (the stable symlink from the udev rule above) and runs as root so CPU power works. It documents a least-privilege alternative (a `dialout` user, with `cpu.power` then reporting 0) inline.
 
@@ -377,12 +379,6 @@ cargo test                            # unit tests (add --features gui for the t
 ```
 
 The GUI pulls `egui-phosphor` from a git fork (crates.io's 0.14 still targets egui 0.36), so the first build needs network access to GitHub.
-
-Note: `.cargo/config.toml` configures clang+mold for CI. On machines without them:
-
-```bash
-RUSTFLAGS="" CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc cargo build --release
-```
 
 ## APK Source Reference
 
